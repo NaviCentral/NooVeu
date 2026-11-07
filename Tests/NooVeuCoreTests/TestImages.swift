@@ -132,3 +132,84 @@ extension TestImages {
         }
     }
 }
+
+extension TestImages {
+    /// A picture where every pixel differs: red grows to the right, green downward, blue along the
+    /// diagonal. Any tile cut from the wrong place shows at once.
+    ///
+    /// With `smooth`, blue also grows steadily instead of wrapping around, so there are no sharp colour
+    /// edges: a better stand-in for a photograph when testing lossy formats.
+    static func gradient(width: Int, height: Int, smooth: Bool = false) -> CGImage {
+        let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+                                space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)!
+        let bytes = context.data!.bindMemory(to: UInt8.self, capacity: context.bytesPerRow * height)
+        for y in 0..<height {
+            for x in 0..<width {
+                let offset = y * context.bytesPerRow + x * 4
+                bytes[offset] = UInt8(x * 255 / max(width - 1, 1))
+                bytes[offset + 1] = UInt8(y * 255 / max(height - 1, 1))
+                bytes[offset + 2] = smooth ? UInt8((x + y) * 255 / max(width + height - 2, 1)) : UInt8((x * 3 + y * 5) % 256)
+                bytes[offset + 3] = 255
+            }
+        }
+        return context.makeImage()!
+    }
+
+    @discardableResult
+    static func writeGradient(width: Int, height: Int, smooth: Bool = false, to url: URL, type: String, properties: [CFString: Any] = [:]) -> URL {
+        let destination = CGImageDestinationCreateWithURL(url as CFURL, type as CFString, 1, nil)!
+        CGImageDestinationAddImage(destination, gradient(width: width, height: height, smooth: smooth), properties as CFDictionary)
+        precondition(CGImageDestinationFinalize(destination), "could not write \(url.path)")
+        return url
+    }
+
+    /// The pixels of `image` as sRGB RGBA bytes, rows top to bottom.
+    static func rgba(_ image: CGImage) -> [UInt8] {
+        let context = CGContext(data: nil, width: image.width, height: image.height, bitsPerComponent: 8, bytesPerRow: image.width * 4,
+                                space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+        context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+        return Array(UnsafeBufferPointer(start: context.data!.bindMemory(to: UInt8.self, capacity: image.width * image.height * 4),
+                                         count: image.width * image.height * 4))
+    }
+
+    /// The largest difference in any channel between two images of the same size.
+    static func maxDifference(_ a: CGImage, _ b: CGImage) -> Int {
+        guard a.width == b.width, a.height == b.height else { return Int.max }
+        let x = rgba(a), y = rgba(b)
+        return zip(x, y).map { abs(Int($0) - Int($1)) }.max() ?? 0
+    }
+}
+
+extension TestImages {
+    /// Deterministic noise: every pixel unrelated to its neighbours, which shows any seam or
+    /// misplacement that a smooth picture would hide.
+    static func noise(width: Int, height: Int) -> CGImage {
+        let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+                                space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)!
+        let bytes = context.data!.bindMemory(to: UInt8.self, capacity: context.bytesPerRow * height)
+        var state: UInt64 = 0x9E37_79B9_7F4A_7C15
+        for y in 0..<height {
+            for x in 0..<width {
+                let offset = y * context.bytesPerRow + x * 4
+                for channel in 0..<3 {
+                    state ^= state << 13; state ^= state >> 7; state ^= state << 17
+                    bytes[offset + channel] = UInt8(truncatingIfNeeded: state >> 24)
+                }
+                bytes[offset + 3] = 255
+            }
+        }
+        return context.makeImage()!
+    }
+
+    static func grey(width: Int, height: Int) -> CGImage {
+        let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+                                space: CGColorSpace(name: CGColorSpace.genericGrayGamma2_2)!,
+                                bitmapInfo: CGImageAlphaInfo.none.rawValue)!
+        context.setFillColor(CGColor(gray: 0.4, alpha: 1))
+        context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        return context.makeImage()!
+    }
+}

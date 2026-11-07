@@ -152,6 +152,67 @@ public enum ImageDecoder {
         )
     }
 
+    /// Decodes the first frame for tiling: fully decoded and upright like `decode`, but without the
+    /// texture-size cap, because a tiled image is never uploaded whole.
+    ///
+    /// - Parameter detailFactor: 1 decodes at full resolution; 2, 4, 8... decode at that fraction of the
+    ///   size (a reduced version, for an image too large to hold). JPEG is decoded at the fraction
+    ///   directly, which is fast; other formats are decoded and scaled by ImageIO.
+    /// - Returns: The image, whose `pixelSize` is the reduced size and whose `sourcePixelSize` is the
+    ///   true size.
+    /// - Throws: `DecodeError`.
+    public static func decodeForTiling(_ url: URL, detailFactor: Int = 1) throws -> DecodedImage {
+        let clock = ContinuousClock()
+        let start = clock.now
+        guard let source = makeSource(url), let type = CGImageSourceGetType(source) as String? else {
+            throw DecodeError.unreadable(url)
+        }
+        guard CGImageSourceGetCount(source) > 0 else { throw DecodeError.empty(url) }
+        guard let info = SourceInfo(source) else { throw DecodeError.decodeFailed(url) }
+
+        let factor = max(detailFactor, 1)
+        let target = (info.orientedSize.longestSide + factor - 1) / factor
+        var image: CGImage?
+        if factor == 1 {
+            image = decodeIntoBuffer(source, factor: 1, orientation: info.orientation)
+        } else {
+            if type == "public.jpeg", [2, 4, 8].contains(factor) {
+                image = decodeIntoBuffer(source, factor: factor, orientation: info.orientation)
+                // ImageIO ignores the fraction for a JPEG whose short side is smaller than it is,
+                // and returns the whole image: that would defeat the memory limit.
+                if let decoded = image, max(decoded.width, decoded.height) > target + target / 8 {
+                    image = nil
+                }
+            }
+            if image == nil {
+                image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+                    kCGImageSourceCreateThumbnailFromImageAlways: true,
+                    kCGImageSourceCreateThumbnailWithTransform: true,
+                    kCGImageSourceShouldCacheImmediately: true,
+                    kCGImageSourceThumbnailMaxPixelSize: target,
+                ] as CFDictionary).flatMap { materialize($0, orientation: .up) }
+            }
+            // The thumbnail API refuses some images (a HEIC three pixels tall). If it is small enough
+            // to hold whole anyway, do that.
+            if image == nil, info.orientedSize.width * info.orientedSize.height * 4 <= 256 << 20 {
+                image = decodeIntoBuffer(source, factor: 1, orientation: info.orientation)
+            }
+        }
+        guard let image else { throw DecodeError.decodeFailed(url) }
+        return DecodedImage(cgImage: image, sourcePixelSize: info.orientedSize, typeIdentifier: type,
+                            decodeDuration: clock.now - start)
+    }
+
+    /// Decodes into a bitmap we own without first decoding the whole image into ImageIO's own buffer:
+    /// the draw in `materialize` pulls the pixels straight into ours, so a 100 MP JPEG peaks at about
+    /// the size of the bitmap rather than twice it.
+    private static func decodeIntoBuffer(_ source: CGImageSource, factor: Int, orientation: CGImagePropertyOrientation) -> CGImage? {
+        var imageOptions: [CFString: Any] = [kCGImageSourceShouldCacheImmediately: false]
+        if factor > 1 { imageOptions[kCGImageSourceSubsampleFactor] = factor }
+        guard let decoded = CGImageSourceCreateImageAtIndex(source, 0, imageOptions as CFDictionary) else { return nil }
+        return materialize(decoded, orientation: orientation)
+    }
+
     /// A small preview for thumbnail grids: the file's embedded preview when it has one that is
     /// big enough (at least three quarters of `maxPixelSize`), otherwise ImageIO's own scaled decode.
     ///
