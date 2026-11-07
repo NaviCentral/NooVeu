@@ -1,0 +1,9 @@
+.DS_Store
+.build/
+.swiftpm/
+build/
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+DerivedData/
+Corpus/generated/
+bench-*.json
