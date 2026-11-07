@@ -43,6 +43,9 @@ public actor TileLoader {
     /// Tiles being decoded, and the generation each was started in.
     private var running: [TileID: Int] = [:]
     private var failed: Set<TileID> = []
+    /// Tiles delivered that the view has not yet reported holding. While a delivered tile is still
+    /// being uploaded, a request that does not list it as held must not deliver it a second time.
+    private var awaitingUpload: Set<TileID> = []
     /// Bumped by `invalidate()`: results of decodes started before it are discarded.
     private var generation = 0
     private var isClosed = false
@@ -83,11 +86,16 @@ public actor TileLoader {
     ///
     /// - Parameter alreadyHeld: Tiles the view already has (uploaded to the GPU). They are neither
     ///   delivered again nor decoded, which keeps a view that calls this every frame from re-uploading
-    ///   what it holds. A tile the view drops should be left out of this set the next time.
+    ///   what it holds. A tile the view drops should be left out of this set the next time. A tile
+    ///   delivered but not yet listed here (its upload is under way) is not delivered again by a later
+    ///   request either, as long as it stays wanted; once it has been listed, leaving it out again
+    ///   (the GPU evicted it) asks for it afresh.
     public func want(_ ids: [TileID], alreadyHeld: Set<TileID> = []) {
         guard !isClosed else { return }
         wanted = ids
         let wantedSet = Set(ids)
+        awaitingUpload.formIntersection(wantedSet)
+        awaitingUpload.subtract(alreadyHeld)
 
         statistics.droppedQueued += queue.filter { !wantedSet.contains($0) }.count
         queue.removeAll()
@@ -95,8 +103,11 @@ public actor TileLoader {
         var seen = Set<TileID>()
         for id in ids where seen.insert(id).inserted {
             guard source.grid.isValid(id), !alreadyHeld.contains(id) else { continue }
-            if let cached = cache.value(for: id) {
+            if awaitingUpload.contains(id) {
+                continue
+            } else if let cached = cache.value(for: id) {
                 statistics.cacheHits += 1
+                awaitingUpload.insert(id)
                 delivery.yield(cached)
             } else if running[id] != generation && !failed.contains(id) {
                 queue.append(id)
@@ -112,6 +123,7 @@ public actor TileLoader {
         generation += 1
         cache.removeAll()
         failed.removeAll()
+        awaitingUpload.removeAll()
         guard !isClosed else { return }
         want(wanted)
     }
@@ -123,6 +135,7 @@ public actor TileLoader {
         wanted.removeAll()
         cache.removeAll()
         failed.removeAll()
+        awaitingUpload.removeAll()
         delivery.finish()
     }
 
@@ -150,7 +163,10 @@ public actor TileLoader {
         switch result {
         case .success(let tile):
             cache.insert(tile, for: id, cost: tile.byteCost)
-            if wanted.contains(id) { delivery.yield(tile) }
+            if wanted.contains(id) {
+                awaitingUpload.insert(id)
+                delivery.yield(tile)
+            }
         case .failure:
             statistics.failures += 1
             // Bounded by the number of tiles in the grid (only valid tiles are ever decoded).

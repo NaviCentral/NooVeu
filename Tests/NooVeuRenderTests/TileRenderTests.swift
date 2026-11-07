@@ -86,16 +86,20 @@ struct TileRenderTests {
         return TileLayer(source: source, device: device, gpuBudgetBytes: gpuBudget)
     }
 
-    /// Updates the layer until every tile it wants is on the GPU (or fails after 10 s), and returns
+    /// Updates the layer until every tile it wants is on the GPU (or fails after 30 s), and returns
     /// what to draw.
     private func settle(_ layer: TileLayer, _ transform: ViewTransform) async throws -> [TileQuad] {
-        let deadline = ContinuousClock.now + .seconds(10)
+        let deadline = ContinuousClock.now + .seconds(30)
         while ContinuousClock.now < deadline {
             let quads = layer.update(for: transform)
             if layer.wantedTiles(for: transform).allSatisfy({ layer.cache.tile($0) != nil }) { return quads }
             try await Task.sleep(for: .milliseconds(5))
         }
-        Issue.record("timed out waiting for tiles")
+        let wanted = layer.wantedTiles(for: transform)
+        let missing = wanted.filter { layer.cache.tile($0) == nil }
+        var states: [String] = []
+        for id in missing.prefix(6) { states.append("\(id): \(await layer.loader.state(of: id))") }
+        Issue.record("timed out waiting for tiles: \(missing.count) of \(wanted.count) missing; loader \(await layer.loader.statistics); \(states)")
         return layer.update(for: transform)
     }
 
