@@ -134,7 +134,9 @@ public actor TileLoader {
             statistics.decodesStarted += 1
             let source = self.source
             Task {
-                let result = await Result { try await source.tile(id) }
+                // (`Result` has an async initialiser only in newer toolchains.)
+                let result: Result<TileBitmap, Error>
+                do { result = .success(try await source.tile(id)) } catch { result = .failure(error) }
                 self.finish(id, startedIn, result)
             }
         }
