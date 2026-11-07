@@ -12,7 +12,9 @@ public enum UpgradePolicy {
         textureLongestSide: Int, sourceLongestSide: Int, zoom: CGFloat, isCustomZoom: Bool
     ) -> Bool {
         // Nothing sharper exists once the texture is as large as the source, or as large as a
-        // texture can be (a 20000 px source decodes to 16384 whatever the request).
+        // texture can be. This is only a first filter: a full-resolution decode can still come out
+        // no larger than the texture on screen (a very wide JPEG is subsampled to stay within the
+        // texture limit), so the caller must also try an upgrade only once per image.
         guard isCustomZoom,
               textureLongestSide < sourceLongestSide,
               textureLongestSide < ImageDecoder.maxTextureDimension else { return false }

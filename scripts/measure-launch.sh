@@ -32,7 +32,7 @@ strict=0
 bare=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --runs) runs="$2"; shift 2 ;;
+    --runs) runs="${2:?--runs needs a number}"; shift 2 ;;
     --strict) strict=1; shift ;;
     --bare) bare=1; shift ;;
     *) break ;;
@@ -65,7 +65,7 @@ for argument in "$@"; do
     failed=1
     continue
   fi
-  if (( bare )) && [[ "$(ls -A "$(dirname "$image")" | wc -l | tr -d ' ')" != "1" ]]; then
+  if (( bare )) && [[ "$(find "$(dirname "$image")" -mindepth 1 -maxdepth 1 ! -name '.*' | wc -l | tr -d ' ')" != "1" ]]; then
     echo "  note: $name: not alone in its folder, so this is not the bare app" >&2
   fi
 

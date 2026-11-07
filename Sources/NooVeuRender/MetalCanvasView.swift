@@ -179,7 +179,14 @@ public final class MetalCanvasView: MTKView {
     public override func smartMagnify(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
         if transform.mode == .fit {
-            zoomToActualPixels(anchor: point)
+            // An image no larger than the view is already at 1:1; magnify it instead.
+            if transform.fitZoom >= 1 {
+                guard hasImage else { return }
+                transform.setZoom(2, anchor: point)
+                changed()
+            } else {
+                zoomToActualPixels(anchor: point)
+            }
         } else {
             zoomToFit()
         }

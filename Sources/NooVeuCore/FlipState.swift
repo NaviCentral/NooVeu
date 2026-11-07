@@ -4,7 +4,7 @@ import Foundation
 ///
 /// Pure value logic with no UI, so the rules for flipping (wrapping, direction, what to warm
 /// up next) can be tested on their own. The viewer owns one per window.
-public struct FlipState: Sendable, Equatable {
+public struct FlipState: Sendable {
     public private(set) var listing: FolderListing?
     public private(set) var index: Int?
     /// +1 after moving forward, -1 after moving back. Preloading favours this direction.

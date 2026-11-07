@@ -27,10 +27,6 @@ public enum FormatRegistry {
         return result
     }
 
-    public static func canRead(_ url: URL) -> Bool {
-        canRead(fileExtension: url.pathExtension)
-    }
-
     private static func computeCanRead(_ fileExtension: String) -> Bool {
         guard let type = UTType(filenameExtension: fileExtension) else { return false }
         if readableTypes.contains(type.identifier) { return true }

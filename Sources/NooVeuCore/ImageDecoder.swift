@@ -14,10 +14,11 @@ public enum DecodeError: Error, Equatable, Sendable {
 public struct DecodeOptions: Hashable, Sendable {
     /// The longest side the caller needs, in pixels; `nil` means full resolution.
     ///
-    /// This is a hint, not an exact size: the decoder may return a somewhat larger or
-    /// slightly smaller bitmap when that is much faster (see `DecodeStrategy`), and the GPU
-    /// scales it to the screen.
-    public var maxPixelSize: Int?
+    /// This is a hint, not an exact size. A JPEG may come back a quarter smaller (it is decoded
+    /// at 1/2, 1/4 or 1/8 size), HEIC and AVIF come back at the size asked for, and every other
+    /// format (PNG, TIFF, RAW...) comes back at full resolution whatever is asked, as does any
+    /// file that refuses to scale. The GPU scales the result to the screen.
+    public let maxPixelSize: Int?
 
     public init(maxPixelSize: Int? = nil) {
         // Zero or negative sizes mean "as small as possible", never "unlimited".
@@ -56,7 +57,9 @@ public enum DecodeStrategy: Equatable, Sendable {
     case thumbnail(maxPixelSize: Int)
 
     private static let subsampledTypes: Set<String> = ["public.jpeg"]
-    private static let thumbnailTypes: Set<String> = ["public.heic", "public.heif", "public.avif", "public.avci"]
+    private static let thumbnailTypes: Set<String> = [
+        "public.heic", "public.heics", "public.heif", "public.avif", "public.avis", "public.avci",
+    ]
 
     /// - Parameters:
     ///   - typeIdentifier: The source's uniform type identifier.
@@ -149,24 +152,40 @@ public enum ImageDecoder {
         )
     }
 
-    /// A small preview for thumbnail grids. Uses the file's embedded thumbnail when it has
-    /// one, and decodes (with fast subsampling where the format allows) when it does not.
+    /// A small preview for thumbnail grids: the file's embedded preview when it has one that is
+    /// big enough (at least three quarters of `maxPixelSize`), otherwise ImageIO's own scaled decode.
+    ///
+    /// The result is a plain `CGImage` in whatever layout ImageIO produces; unlike `decode`, it is
+    /// not necessarily in a layout Metal uploads directly.
     /// - Throws: `DecodeError`.
-    public static func thumbnail(_ url: URL, maxPixelSize: Int) throws -> DecodedImage {
+    public static func thumbnail(_ url: URL, maxPixelSize requested: Int) throws -> DecodedImage {
         let clock = ContinuousClock()
         let start = clock.now
+        let maxPixelSize = max(requested, 1)
 
         guard let source = makeSource(url), CGImageSourceGetType(source) != nil else {
             throw DecodeError.unreadable(url)
         }
         guard CGImageSourceGetCount(source) > 0 else { throw DecodeError.empty(url) }
         let info = SourceInfo(source)
-        guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
-            kCGImageSourceCreateThumbnailFromImageIfAbsent: true,
-            kCGImageSourceCreateThumbnailWithTransform: true,
-            kCGImageSourceShouldCacheImmediately: true,
-            kCGImageSourceThumbnailMaxPixelSize: maxPixelSize,
-        ] as CFDictionary) else { throw DecodeError.decodeFailed(url) }
+        func make(embeddedAllowed: Bool) -> CGImage? {
+            CGImageSourceCreateThumbnailAtIndex(source, 0, [
+                embeddedAllowed ? kCGImageSourceCreateThumbnailFromImageIfAbsent : kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceCreateThumbnailWithTransform: true,
+                kCGImageSourceShouldCacheImmediately: true,
+                kCGImageSourceThumbnailMaxPixelSize: maxPixelSize,
+            ] as CFDictionary)
+        }
+        var preview = make(embeddedAllowed: true)
+        // An embedded preview smaller than asked for (cameras embed about 160 px) would be blurry in
+        // a bigger cell: decode the image instead, unless the source is no larger than the preview.
+        if let current = preview, let info {
+            let longest = max(current.width, current.height)
+            if longest * 4 < maxPixelSize * 3, info.orientedSize.longestSide > longest {
+                preview = make(embeddedAllowed: false) ?? preview
+            }
+        }
+        guard let image = preview else { throw DecodeError.decodeFailed(url) }
 
         return DecodedImage(
             cgImage: image,

@@ -16,7 +16,8 @@ public struct PixelSize: Hashable, Sendable, CustomStringConvertible {
     public var description: String { "\(width)×\(height)" }
 }
 
-/// A decoded, display-ready bitmap.
+/// A decoded bitmap. From `ImageDecoder.decode` it is fully decoded and in a layout Metal uploads
+/// directly; a thumbnail is a plain `CGImage` in whatever layout ImageIO produced.
 ///
 /// `CGImage` is immutable, so a `DecodedImage` is safe to share between threads.
 public struct DecodedImage: @unchecked Sendable {

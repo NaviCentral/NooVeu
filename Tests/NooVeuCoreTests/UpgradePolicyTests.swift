@@ -23,6 +23,12 @@ struct UpgradePolicyTests {
         #expect(!decide(zoom: 1, custom: false))
     }
 
+    @Test func theThresholdIsStrictlyFivePercentAboveTheTexturesOwnResolution() {
+        // 3060 / 12240 = 0.25: the boundary is 0.2625.
+        #expect(!decide(zoom: 0.2625))
+        #expect(decide(zoom: 0.2626))
+    }
+
     @Test func neverUpgradesWhenThereIsNothingSharper() {
         #expect(!decide(texture: 12240, source: 12240, zoom: 4), "already full size")
         // A 20000 px source decodes to at most 16384 whatever is requested, so asking again

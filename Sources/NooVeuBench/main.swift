@@ -3,7 +3,7 @@ import Foundation
 /// nooveu-bench: builds the test corpus and checks the performance targets.
 ///
 ///     nooveu-bench corpus <dir> [--quick]
-///     nooveu-bench run <dir> [--iterations N] [--json FILE] [--enforce]
+///     nooveu-bench run <dir> [--iterations N] [--screen N] [--json FILE] [--enforce]
 ///
 /// Build in release mode (`swift run -c release nooveu-bench …`); debug timings mean nothing.
 
@@ -70,7 +70,11 @@ do {
         let screenSide = positiveInt(after: "--screen", default: 3456, minimum: 512, in: arguments)
         let report = try await Benchmark.run(corpus: folder, iterations: iterations, screenSide: screenSide, log: log)
         report.printSummary()
-        if let path = value(after: "--json", in: arguments) {
+        if arguments.contains("--json") {
+            guard let path = value(after: "--json", in: arguments), !path.hasPrefix("--") else {
+                FileHandle.standardError.write(Data("error: --json needs a file name\n".utf8))
+                exit(64)
+            }
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             try encoder.encode(report).write(to: URL(fileURLWithPath: path))

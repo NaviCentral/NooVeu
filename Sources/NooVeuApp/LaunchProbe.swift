@@ -12,7 +12,11 @@ import Darwin
 /// and reports medians.
 @MainActor
 enum LaunchProbe {
-    static let isEnabled = ProcessInfo.processInfo.environment["NOOVEU_LAUNCH_PROBE"] != nil
+    /// On when `NOOVEU_LAUNCH_PROBE` is set to anything but empty or `0`.
+    static let isEnabled: Bool = {
+        let value = ProcessInfo.processInfo.environment["NOOVEU_LAUNCH_PROBE"] ?? ""
+        return !value.isEmpty && value != "0"
+    }()
 
     private static var settleSeconds: Double {
         ProcessInfo.processInfo.environment["NOOVEU_PROBE_SETTLE_SECONDS"].flatMap(Double.init) ?? 3

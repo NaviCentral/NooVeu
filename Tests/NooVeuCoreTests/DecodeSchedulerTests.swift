@@ -80,7 +80,7 @@ struct DecodeSchedulerTests {
         #expect(fake.callCount(for: url("a.jpg")) == 1)
     }
 
-    @Test func failuresReachEveryWaiterAndAreNotCached() async throws {
+    @Test func aFailureIsNotCachedSoARepeatedRequestDecodesAgain() async throws {
         let fake = FakeDecoder()
         let scheduler = DecodeScheduler(costLimit: 1 << 20, decoder: fake.decoder)
 
@@ -110,14 +110,15 @@ struct DecodeSchedulerTests {
         #expect(fake.peakActive == 3)
     }
 
-    @Test func visibleRequestsJumpAheadOfPreloads() async throws {
+    @Test func aVisibleRequestStartsAtOnceWhileAPreloadRunsAndPreloadsWaitForTheirSlot() async throws {
         let fake = FakeDecoder(gated: true)
         let scheduler = DecodeScheduler(costLimit: 1 << 30, maxConcurrentDecodes: 1, decoder: fake.decoder)
 
         await scheduler.preload([url("p1.jpg"), url("p2.jpg"), url("p3.jpg")])
-        try await eventually { fake.calls.count == 1 }  // p1 is running and holds the only slot
+        try await eventually { fake.calls.count == 1 }  // p1 holds the only preload slot
         async let visible = scheduler.image(for: url("v.jpg"))
-        try await eventually { await scheduler.queuedCount == 3 }  // p2, p3 and v are all waiting
+        try await eventually { fake.calls.count == 2 }  // v starts at once, in a burst slot
+        #expect(fake.calls.map(\.lastPathComponent) == ["p1.jpg", "v.jpg"])
         fake.release(4)
         _ = try await visible
         try await eventually { fake.calls.count == 4 }
@@ -170,19 +171,23 @@ struct DecodeSchedulerTests {
 
     @Test func aCancelledVisibleRequestLeavesTheQueue() async throws {
         let fake = FakeDecoder(gated: true)
+        // One slot plus two burst slots: three visible decodes fill everything.
         let scheduler = DecodeScheduler(costLimit: 1 << 30, maxConcurrentDecodes: 1, decoder: fake.decoder)
 
-        let holder = Task { try await scheduler.image(for: url("hold.jpg")) }
-        try await eventually { fake.calls.count == 1 }
+        let running = (1...3).map { n in Task { try await scheduler.image(for: url("v\(n).jpg")) } }
+        try await eventually { fake.calls.count == 3 }
         let doomed = Task { try await scheduler.image(for: url("doomed.jpg")) }
         try await eventually { await scheduler.queuedCount == 1 }
         doomed.cancel()
         try await eventually { await scheduler.queuedCount == 0 }
-        fake.release(2)
-        _ = try await holder.value
+        fake.release(4)
+        for task in running { _ = try await task.value }
 
         await #expect(throws: CancellationError.self) { try await doomed.value }
-        #expect(fake.calls.map(\.lastPathComponent) == ["hold.jpg"])
+        // The three tasks reach the scheduler in no fixed order; what matters is that the
+        // cancelled request was never decoded.
+        #expect(Set(fake.calls.map(\.lastPathComponent)) == ["v1.jpg", "v2.jpg", "v3.jpg"])
+        #expect(fake.callCount(for: url("doomed.jpg")) == 0)
         #expect(await scheduler.statistics.cancelledRequests == 1)
     }
 
@@ -312,16 +317,20 @@ struct DecodeSchedulerTests {
         let fake = FakeDecoder(gated: true)
         let scheduler = DecodeScheduler(costLimit: 1 << 30, maxConcurrentDecodes: 1, decoder: fake.decoder)
 
+        // hold runs as the preload; two visible decodes fill the burst slots; x waits as a preload.
         await scheduler.preload([url("hold.jpg"), url("x.jpg")])
-        try await eventually { fake.calls.count == 1 }  // hold runs, x is queued as a preload
+        let busy = (1...2).map { n in Task { try await scheduler.image(for: url("v\(n).jpg")) } }
+        try await eventually { fake.calls.count == 3 }
+        #expect(await scheduler.queuedCount == 1)
+        // The user asks for x: promoted, but no slot is free. Then they move on.
         let promoted = Task { try await scheduler.image(for: url("x.jpg")) }
         try await eventually { await scheduler.statistics.joinedInFlight == 1 }
         promoted.cancel()
         try await eventually { await scheduler.statistics.cancelledRequests == 1 }
 
         #expect(await scheduler.queuedCount == 1, "x is still wanted by the last preload call")
-        await scheduler.preload([url("hold.jpg"), url("x.jpg")])
-        fake.release(2)
+        fake.release(5)
+        for task in busy { _ = try await task.value }
         try await eventually { fake.callCount(for: url("x.jpg")) == 1 }
     }
 
@@ -338,6 +347,121 @@ struct DecodeSchedulerTests {
         // Same bytes and size, saved a minute later.
         try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(60)],
                                               ofItemAtPath: folder.file("a.jpg").path)
+        _ = try await scheduler.image(for: folder.file("a.jpg"))
+
+        #expect(fake.callCount(for: folder.file("a.jpg")) == 2)
+    }
+
+    @Test func fastFlippingNeverLeavesTheNewImageWaitingBehindAbandonedDecodes() async throws {
+        let fake = FakeDecoder(gated: true)
+        let scheduler = DecodeScheduler(costLimit: 1 << 30, maxConcurrentDecodes: 2, decoder: fake.decoder)
+
+        await scheduler.preload([url("p1.jpg"), url("p2.jpg")])
+        try await eventually { fake.calls.count == 1 }  // one preload slot
+        let first = Task { try await scheduler.image(for: url("v1.jpg")) }
+        try await eventually { fake.calls.count == 2 }  // both slots busy
+        first.cancel()  // the user flips on; v1's decode cannot be interrupted
+        try await eventually { await scheduler.statistics.cancelledRequests == 1 }
+        async let second = scheduler.image(for: url("v2.jpg"))
+
+        try await eventually { fake.calls.count == 3 }
+        #expect(fake.calls.map(\.lastPathComponent) == ["p1.jpg", "v1.jpg", "v2.jpg"], "v2 starts without waiting")
+        fake.release(5)
+        _ = try await second
+    }
+
+    @Test func abandonedDecodesCannotPileUpWithoutLimit() async throws {
+        let fake = FakeDecoder(gated: true)
+        let scheduler = DecodeScheduler(costLimit: 1 << 30, maxConcurrentDecodes: 2, decoder: fake.decoder)
+
+        // A user holding the arrow key: each image is requested, then abandoned a moment later.
+        var abandoned: [Task<DecodedImage, Error>] = []
+        for n in 0..<10 {
+            abandoned.append(Task { try await scheduler.image(for: url("v\(n).jpg")) })
+            try await Task.sleep(for: .milliseconds(15))
+            abandoned.last!.cancel()
+        }
+        try await Task.sleep(for: .milliseconds(50))
+
+        // The bound is what matters, so a request that registers late cannot make this flaky.
+        #expect(fake.peakActive <= 2 + 2, "never more than the limit plus two burst slots")
+        #expect(fake.peakActive >= 3, "the burst slots were used")
+        fake.release(20)
+        for task in abandoned { _ = try? await task.value }
+    }
+
+    @Test func aRequestFromAnAlreadyCancelledTaskNeverStartsADecode() async throws {
+        let fake = FakeDecoder()
+        let scheduler = DecodeScheduler(costLimit: 1 << 30, decoder: fake.decoder)
+
+        let task = Task {
+            while !Task.isCancelled { await Task.yield() }
+            return try await scheduler.image(for: url("a.jpg"))
+        }
+        task.cancel()
+
+        await #expect(throws: CancellationError.self) { try await task.value }
+        #expect(await scheduler.statistics.decodesStarted == 0)
+    }
+
+    @Test func purgeAlsoForgetsWhichFilesFailed() async throws {
+        let fake = FakeDecoder()
+        let scheduler = DecodeScheduler(costLimit: 1 << 30, decoder: fake.decoder)
+        await scheduler.preload([url("bad.jpg")])
+        try await eventually { await scheduler.failedCount == 1 }
+
+        await scheduler.purge()
+
+        #expect(await scheduler.failedCount == 0)
+        await scheduler.preload([url("bad.jpg")])
+        #expect(await scheduler.statistics.decodesStarted == 2, "forgotten, so tried again")
+    }
+
+    @Test func preloadSkipsWhatIsAlreadyCached() async throws {
+        let fake = FakeDecoder()
+        let scheduler = DecodeScheduler(costLimit: 1 << 30, decoder: fake.decoder)
+        _ = try await scheduler.image(for: url("a.jpg"))
+
+        await scheduler.preload([url("a.jpg")])
+
+        #expect(await scheduler.statistics.decodesStarted == 1)
+        #expect(await scheduler.cachedImage(for: url("a.jpg")) != nil)
+    }
+
+    @Test func differentOptionsAreSeparateCacheEntries() async throws {
+        let fake = FakeDecoder()
+        let scheduler = DecodeScheduler(costLimit: 1 << 30, decoder: fake.decoder)
+
+        _ = try await scheduler.image(for: url("a.jpg"), options: .fitting(100))
+        _ = try await scheduler.image(for: url("a.jpg"), options: .fullResolution)
+
+        #expect(fake.callCount(for: url("a.jpg")) == 2)
+        #expect(await scheduler.cachedImage(for: url("a.jpg"), options: .fitting(100)) != nil)
+        #expect(await scheduler.cachedImage(for: url("a.jpg"), options: .fitting(200)) == nil)
+    }
+
+    @Test func theMemoryOfFailedFilesIsBounded() async throws {
+        let fake = FakeDecoder()
+        let scheduler = DecodeScheduler(costLimit: 1 << 30, decoder: fake.decoder)
+
+        await scheduler.preload((0..<300).map { url("bad\($0).jpg") })
+        try await eventually { fake.calls.count == 300 }
+        try await eventually { await scheduler.queuedCount == 0 }
+
+        let remembered = await scheduler.failedCount
+        #expect(remembered > 0 && remembered <= 256)
+    }
+
+    @Test func aNewModificationTimeWithinTheSameSecondStillInvalidatesTheCache() async throws {
+        let folder = try TemporaryFolder()
+        try folder.touch("a.jpg", contents: "same size every time")
+        let fake = FakeDecoder()
+        let scheduler = DecodeScheduler(costLimit: 1 << 30, decoder: fake.decoder)
+        let path = folder.file("a.jpg").path
+
+        try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: 1_700_000_000.1)], ofItemAtPath: path)
+        _ = try await scheduler.image(for: folder.file("a.jpg"))
+        try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: 1_700_000_000.4)], ofItemAtPath: path)
         _ = try await scheduler.image(for: folder.file("a.jpg"))
 
         #expect(fake.callCount(for: folder.file("a.jpg")) == 2)
@@ -367,11 +491,10 @@ struct DecodeSchedulerTests {
         _ = try await visible
     }
 
-    @Test func defaultsScaleWithTheMac() {
-        #expect(DecodeScheduler.defaultCostLimit(physicalMemory: 8 << 30) == 1 << 30)
-        #expect(DecodeScheduler.defaultCostLimit(physicalMemory: 64 << 30) == 2 << 30)
-        #expect(DecodeScheduler.defaultCostLimit(physicalMemory: 1 << 30) == 256 << 20)
+    @Test func theCacheBudgetIsFlatAndTheConcurrencyScalesWithTheCores() {
+        #expect(DecodeScheduler.defaultCostLimit == 512 << 20)
         #expect(DecodeScheduler.defaultConcurrency(cores: 8) == 4)
         #expect(DecodeScheduler.defaultConcurrency(cores: 3) == 2)
+        #expect(DecodeScheduler.defaultConcurrency(cores: 32) == 4, "never more than four decodes at once")
     }
 }

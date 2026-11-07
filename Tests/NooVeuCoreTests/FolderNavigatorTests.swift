@@ -86,6 +86,44 @@ struct FolderNavigatorTests {
         #expect(listing.preloadOrder(around: 5, ahead: 1, behind: 3, wrapping: false, favouringForward: true) == [6, 4, 3, 2])
     }
 
+    @Test func hugeStepsAndHugeReachNeitherTrapNorSpin() {
+        let listing = FolderListing(folder: URL(fileURLWithPath: "/x"), items: (0..<5).map { URL(fileURLWithPath: "/x/\($0).jpg") })
+
+        #expect(listing.index(2, offsetBy: Int.max, wrapping: true) != nil)
+        #expect(listing.index(2, offsetBy: Int.min, wrapping: true) != nil)
+        #expect(listing.index(2, offsetBy: Int.max, wrapping: false) == nil)
+        #expect(listing.index(2, offsetBy: Int.min, wrapping: false) == nil)
+        #expect(listing.preloadOrder(around: 2, ahead: Int.max, behind: Int.max, wrapping: true).sorted() == [0, 1, 3, 4])
+    }
+
+    @Test func theSameFileSpelledWithDifferentCaseIsListedOnce() throws {
+        let folder = try TemporaryFolder()
+        TestImages.write(width: 8, height: 8, to: folder.file("Photo.PNG"))
+        TestImages.write(width: 8, height: 8, to: folder.file("zzz.png"))
+        let other = folder.file("photo.png")
+        // Only meaningful on a case-insensitive volume (the default for macOS).
+        guard FileManager.default.fileExists(atPath: other.path) else { return }
+
+        let listing = try FolderNavigator.listing(containing: other)
+
+        #expect(listing.count == 2, "the same file must not appear twice")
+        let index = try #require(listing.index(of: other))
+        #expect(listing.items[index].lastPathComponent == "Photo.PNG")
+    }
+
+    @Test func anEmptyFolderListsNothingAndAFilePathIsAnError() throws {
+        let folder = try TemporaryFolder()
+        try folder.touch("note.txt")
+
+        #expect(try FolderNavigator.listing(of: folder.url).items.isEmpty)
+        #expect(throws: (any Error).self) { try FolderNavigator.listing(of: folder.file("note.txt")) }
+    }
+
+    @Test func canonicalUrlsMakeEquivalentPathsEqual() {
+        #expect(FolderNavigator.canonical(URL(fileURLWithPath: "/tmp/nooveu-x.jpg"))
+                == FolderNavigator.canonical(URL(fileURLWithPath: "/private/tmp/nooveu-x.jpg")))
+    }
+
     @Test func preloadOrderNeverRepeatsInSmallFolders() {
         let listing = FolderListing(folder: URL(fileURLWithPath: "/x"), items: (0..<3).map { URL(fileURLWithPath: "/x/\($0).jpg") })
 

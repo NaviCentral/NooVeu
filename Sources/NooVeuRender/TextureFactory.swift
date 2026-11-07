@@ -6,6 +6,9 @@ import NooVeuCore
 
 public enum TextureError: Error, Sendable {
     case conversionFailed
+    /// The image is larger than the biggest texture the GPU supports. `MTKTextureLoader` does not
+    /// throw for this: it aborts the process, so the size is checked first.
+    case tooLarge(width: Int, height: Int)
 }
 
 /// A GPU texture ready to draw, with the colour space its values are encoded in.
@@ -18,10 +21,10 @@ public struct PreparedTexture: @unchecked Sendable {
 
 /// Turns decoded bitmaps into mipmapped GPU textures, off the main thread.
 ///
-/// 8-bit RGB images go up as they are and the layer is tagged with their colour space, so
-/// macOS colour-manages them to the display. Everything else (greyscale, CMYK, indexed,
-/// 16-bit) is first redrawn into 8-bit Display P3. Wide-gamut and HDR handling at full
-/// precision is phase 1 work.
+/// 8-bit RGB images in a layout Metal takes directly go up as they are and the layer is tagged
+/// with their colour space, so macOS colour-manages them to the display. Anything else is first
+/// redrawn into 8-bit Display P3 (the decoder already reduces greyscale, CMYK and 16-bit images to
+/// 8-bit RGB, so this is a safety net). Wide-gamut and HDR handling at full precision is later work.
 ///
 /// `MTKTextureLoader` is safe to call from any thread and `MTLDevice` is immutable here, so
 /// the factory is shared freely.
@@ -35,17 +38,24 @@ public final class TextureFactory: @unchecked Sendable {
         self.loader = MTKTextureLoader(device: device)
     }
 
+    /// Largest width or height of a texture on Apple Silicon GPUs.
+    public static let maxDimension = 16_384
+
     /// Converts (when needed) and uploads `image`, including the GPU's mipmap generation, and
     /// returns when the texture is ready to draw. Runs on a background executor: the main
     /// thread is free while a 100 MP image goes up.
+    /// - Throws: `TextureError.tooLarge` for an image beyond `maxDimension` on either side.
     @concurrent
     public func makeTexture(from image: CGImage) async throws -> PreparedTexture {
+        guard image.width <= Self.maxDimension, image.height <= Self.maxDimension else {
+            throw TextureError.tooLarge(width: image.width, height: image.height)
+        }
         let clock = ContinuousClock()
         let start = clock.now
 
         var source = image
         var colorSpace = image.colorSpace
-        if !image.isMetalUploadable || colorSpace == nil {
+        if !image.isMetalUploadable {
             (source, colorSpace) = try Self.redrawAsDisplayP3(image)
         }
 
@@ -61,7 +71,6 @@ public final class TextureFactory: @unchecked Sendable {
     }
 
     nonisolated(unsafe) private static let loaderOptions: [MTKTextureLoader.Option: Any] = [
-        .SRGB: false,
         .allocateMipmaps: true,
         .generateMipmaps: true,
         .textureUsage: NSNumber(value: MTLTextureUsage.shaderRead.rawValue),

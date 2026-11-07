@@ -2,6 +2,7 @@ import CoreGraphics
 import Metal
 import Testing
 @testable import NooVeuRender
+import NooVeuCore
 
 /// Renders real textures through the same code the app draws with and checks the pixels.
 @Suite("Rendering", .enabled(if: MTLCreateSystemDefaultDevice() != nil))
@@ -161,6 +162,77 @@ struct RenderTests {
         #expect(near(frame.pixel(x: 64, y: 96, in: bytes), (0, 0, 0)), "just below the image")
     }
 
+    // MARK: Sampler choice
+
+    /// Counts pixels in row `y` from `x0` up to (not including) `x1` that are neither black nor white.
+    private func greyPixels(_ frame: ImageRenderer.Frame, _ bytes: [UInt8], y: Int, from x0: Int, to x1: Int) -> Int {
+        (x0..<x1).filter { x in
+            let r = frame.pixel(x: x, y: y, in: bytes).r
+            return r > 2 && r < 253
+        }.count
+    }
+
+    @Test func magnifiedPixelsAreSharpAtTwoTimesAndAbove() async throws {
+        // 4 columns of alternating white and black at 4x: every source pixel becomes a 4-pixel
+        // block with a hard edge, not a gradient.
+        var transform = ViewTransform(imageSize: CGSize(width: 4, height: 4),
+                                      viewSize: CGSize(width: 40, height: 20), backingScale: 1)
+        transform.setZoom(4)
+        let rect = transform.imageRectInView
+
+        let (bytes, frame) = try await render(stripes(4, 4), transform: transform)
+
+        #expect(greyPixels(frame, bytes, y: 10, from: Int(rect.minX), to: Int(rect.maxX)) == 0)
+    }
+
+    @Test func magnificationBelowTwoTimesIsSmooth() async throws {
+        // The same image at 1.5x is interpolated: edges between columns blend.
+        var transform = ViewTransform(imageSize: CGSize(width: 4, height: 4),
+                                      viewSize: CGSize(width: 40, height: 20), backingScale: 1)
+        transform.setZoom(1.5)
+        let rect = transform.imageRectInView
+
+        let (bytes, frame) = try await render(stripes(4, 4), transform: transform)
+
+        #expect(greyPixels(frame, bytes, y: 10, from: Int(rect.minX), to: Int(rect.maxX) + 1) > 0)
+    }
+
+    // MARK: Upload
+
+    @Test func anImageBeyondTheTextureLimitIsRefusedNotAborted() async throws {
+        // MTKTextureLoader aborts the whole process for this; the factory must throw instead.
+        let device = MTLCreateSystemDefaultDevice()!
+        let factory = try #require(TextureFactory(device: device))
+        let context = CGContext(data: nil, width: TextureFactory.maxDimension + 1, height: 2, bitsPerComponent: 8,
+                                bytesPerRow: 0, space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                bitmapInfo: CGImageAlphaInfo.noneSkipFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue)!
+
+        await #expect(throws: TextureError.self) {
+            _ = try await factory.makeTexture(from: context.makeImage()!)
+        }
+    }
+
+    @Test func aGreyImageIsRedrawnIntoColourAndKeepsItsTone() async throws {
+        // Greyscale is not a layout Metal takes directly: the factory redraws it, and the grey must
+        // still be a mid grey (equal red, green and blue) on screen.
+        let context = CGContext(data: nil, width: 8, height: 8, bitsPerComponent: 8, bytesPerRow: 0,
+                                space: CGColorSpace(name: CGColorSpace.genericGrayGamma2_2)!,
+                                bitmapInfo: CGImageAlphaInfo.none.rawValue)!
+        context.setFillColor(CGColor(gray: 0.5, alpha: 1))
+        context.fill(CGRect(x: 0, y: 0, width: 8, height: 8))
+        let grey = context.makeImage()!
+        #expect(!grey.isMetalUploadable)
+        var transform = ViewTransform(imageSize: CGSize(width: 8, height: 8),
+                                      viewSize: CGSize(width: 16, height: 16), backingScale: 1)
+        transform.setZoom(1)
+
+        let (bytes, frame) = try await render(grey, transform: transform)
+
+        let pixel = frame.pixel(x: 8, y: 8, in: bytes)
+        #expect(abs(Int(pixel.r) - Int(pixel.g)) <= 2 && abs(Int(pixel.g) - Int(pixel.b)) <= 2)
+        #expect(pixel.r > 90 && pixel.r < 170, "a mid grey, not black or white: \(pixel.r)")
+    }
+
     @Test func aFrameReportsGPUTime() async throws {
         let transform = ViewTransform(imageSize: CGSize(width: 64, height: 64),
                                       viewSize: CGSize(width: 128, height: 128), backingScale: 1)
@@ -168,5 +240,17 @@ struct RenderTests {
         let (_, frame) = try await render(halves(64, 64), transform: transform)
 
         #expect(frame.gpuSeconds > 0 && frame.gpuSeconds < 1)
+    }
+}
+
+/// The GPU tests above skip themselves where there is no Metal device. On CI that would turn
+/// every one of them into a silent pass, so there it is an error instead.
+@Suite("Rendering environment")
+struct RenderEnvironmentTests {
+    @Test func aMetalDeviceExistsWhereTheGPUTestsAreExpectedToRun() {
+        guard ProcessInfo.processInfo.environment["CI"] != nil else { return }
+
+        #expect(MTLCreateSystemDefaultDevice() != nil,
+                "CI has no Metal device, so the GPU tests were skipped; they must run somewhere")
     }
 }

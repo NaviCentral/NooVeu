@@ -21,6 +21,7 @@ let package = Package(
         .executableTarget(name: "NooVeuBench", dependencies: ["NooVeuCore", "NooVeuRender"]),
         .testTarget(name: "NooVeuCoreTests", dependencies: ["NooVeuCore"]),
         .testTarget(name: "NooVeuRenderTests", dependencies: ["NooVeuRender"]),
+        .testTarget(name: "NooVeuBenchTests", dependencies: ["NooVeuBench"]),
     ],
     swiftLanguageModes: [.v6]
 )
