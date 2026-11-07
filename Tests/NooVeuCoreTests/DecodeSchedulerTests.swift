@@ -90,16 +90,24 @@ struct DecodeSchedulerTests {
         #expect(fake.callCount(for: url("bad.jpg")) == 2)
     }
 
-    @Test func neverRunsMoreDecodesThanItsLimit() async throws {
+    @Test func neverExceedsItsLimitAndKeepsASlotFreeForTheVisibleImage() async throws {
         let fake = FakeDecoder(gated: true)
-        let scheduler = DecodeScheduler(costLimit: 1 << 30, maxConcurrentDecodes: 2, decoder: fake.decoder)
+        let scheduler = DecodeScheduler(costLimit: 1 << 30, maxConcurrentDecodes: 3, decoder: fake.decoder)
+        #expect(scheduler.maxConcurrentPreloads == 2)
 
         await scheduler.preload((0..<6).map { url("\($0).jpg") })
         try await eventually { fake.calls.count == 2 }
-        fake.release(6)
-        try await eventually { await scheduler.cachedCount == 6 }
+        try await Task.sleep(for: .milliseconds(50))
+        #expect(fake.calls.count == 2, "preloads stop one short of the limit")
 
-        #expect(fake.peakActive == 2)
+        // The image the user flips to starts at once, while both preloads are still running.
+        async let visible = scheduler.image(for: url("now.jpg"))
+        try await eventually { fake.calls.count == 3 }
+        fake.release(7)
+        _ = try await visible
+        try await eventually { await scheduler.cachedCount == 7 }
+
+        #expect(fake.peakActive == 3)
     }
 
     @Test func visibleRequestsJumpAheadOfPreloads() async throws {
@@ -333,6 +341,30 @@ struct DecodeSchedulerTests {
         _ = try await scheduler.image(for: folder.file("a.jpg"))
 
         #expect(fake.callCount(for: folder.file("a.jpg")) == 2)
+    }
+
+    @Test func theReservedSlotScalesWithTheLimit() {
+        let reserved = [1, 2, 3, 4, 8].map {
+            DecodeScheduler(maxConcurrentDecodes: $0, decoder: FakeDecoder().decoder).maxConcurrentPreloads
+        }
+
+        #expect(reserved == [1, 1, 2, 3, 7], "all but one slot, and never fewer than one")
+    }
+
+    @Test func withTwoSlotsAVisibleRequestStartsWhileAPreloadRuns() async throws {
+        let fake = FakeDecoder(gated: true)
+        let scheduler = DecodeScheduler(costLimit: 1 << 30, maxConcurrentDecodes: 2, decoder: fake.decoder)
+
+        await scheduler.preload([url("p1.jpg"), url("p2.jpg"), url("p3.jpg")])
+        try await eventually { fake.calls.count == 1 }
+        try await Task.sleep(for: .milliseconds(50))
+        #expect(fake.calls.count == 1, "only one preload may run")
+
+        async let visible = scheduler.image(for: url("v.jpg"))
+        try await eventually { fake.calls.count == 2 }
+        #expect(fake.calls.map(\.lastPathComponent) == ["p1.jpg", "v.jpg"])
+        fake.release(4)
+        _ = try await visible
     }
 
     @Test func defaultsScaleWithTheMac() {

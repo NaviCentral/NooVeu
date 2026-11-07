@@ -104,6 +104,8 @@ enum CorpusGenerator {
         log("Large files")
         var large: [(PixelSize, String, String, String)] = [
             (large24, "jpeg-24mp", "public.jpeg", "jpg"),
+            // Camera files carry a small preview inside; grids of them show it without decoding.
+            (large24, "jpeg-24mp-thumb", "public.jpeg", "jpg"),
             (large24, "heic-24mp", "public.heic", "heic"),
         ]
         if !quick {
@@ -116,8 +118,10 @@ enum CorpusGenerator {
         }
         for (size, category, type, ext) in large {
             let image = makeImage(size, label: "\(category.uppercased())  \(size)", colorSpace: sRGB)
+            var properties = quality(type)
+            if category == "jpeg-24mp-thumb" { properties[kCGImageDestinationEmbedThumbnail] = true }
             add(image, "large/\(category).\(ext)", type: type, category: category,
-                expected: size, properties: quality(type))
+                expected: size, properties: properties)
         }
 
         log("EXIF orientations 1–8")

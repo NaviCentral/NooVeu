@@ -79,6 +79,13 @@ struct FolderNavigatorTests {
         #expect(listing.preloadOrder(around: 0, ahead: 0, behind: 0, wrapping: true) == [])
     }
 
+    @Test func preloadOrderPutsThePreviousImageFirstWhenTravellingBackward() {
+        let listing = FolderListing(folder: URL(fileURLWithPath: "/x"), items: (0..<10).map { URL(fileURLWithPath: "/x/\($0).jpg") })
+
+        #expect(listing.preloadOrder(around: 5, ahead: 1, behind: 3, wrapping: false, favouringForward: false) == [4, 6, 3, 2])
+        #expect(listing.preloadOrder(around: 5, ahead: 1, behind: 3, wrapping: false, favouringForward: true) == [6, 4, 3, 2])
+    }
+
     @Test func preloadOrderNeverRepeatsInSmallFolders() {
         let listing = FolderListing(folder: URL(fileURLWithPath: "/x"), items: (0..<3).map { URL(fileURLWithPath: "/x/\($0).jpg") })
 

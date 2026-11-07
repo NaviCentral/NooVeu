@@ -14,34 +14,26 @@ public final class MetalCanvasView: MTKView {
     public var keyHandler: ((NSEvent) -> Bool)?
     /// Called after zoom, pan or a new image changes what is on screen.
     public var onTransformChange: ((ViewTransform) -> Void)?
-    /// Called once the GPU has finished a frame that shows an image.
-    public var onImageFrameCompleted: (@MainActor @Sendable () -> Void)?
+    /// Called once, when the display has handled a frame showing an image: later than the GPU
+    /// finishing it, and for an occluded window still reached.
+    public var onImageFramePresented: (@MainActor @Sendable () -> Void)?
 
+    private let renderer: ImageRenderer
     private let factory: TextureFactory
-    private let commandQueue: MTLCommandQueue
-    private let pipeline: MTLRenderPipelineState
-    private let smoothSampler: MTLSamplerState
-    private let pixelSampler: MTLSamplerState
     private var texture: MTLTexture?
 
     /// Fails only when Metal is unavailable, which no Apple Silicon Mac lacks.
     public init?(contentFrame frame: CGRect) {
         guard let device = MTLCreateSystemDefaultDevice(),
               let factory = TextureFactory(device: device),
-              let commandQueue = device.makeCommandQueue(),
-              let pipeline = try? Shaders.makePipeline(device: device, pixelFormat: .bgra8Unorm),
-              let smoothSampler = Shaders.makeSampler(device: device, pixelGrid: false),
-              let pixelSampler = Shaders.makeSampler(device: device, pixelGrid: true)
+              let renderer = ImageRenderer(device: device)
         else { return nil }
 
+        self.renderer = renderer
         self.factory = factory
-        self.commandQueue = commandQueue
-        self.pipeline = pipeline
-        self.smoothSampler = smoothSampler
-        self.pixelSampler = pixelSampler
         super.init(frame: frame, device: device)
 
-        colorPixelFormat = .bgra8Unorm
+        colorPixelFormat = renderer.pixelFormat
         clearColor = MTLClearColor(red: 0.11, green: 0.11, blue: 0.12, alpha: 1)
         framebufferOnly = true
         // Draw on demand, not at 120 frames a second.
@@ -56,15 +48,18 @@ public final class MetalCanvasView: MTKView {
 
     // MARK: Showing images
 
-    /// Uploads `image` and shows it.
+    /// Uploads `image` to the GPU without blocking the main thread. Pass the result to
+    /// `show(_:of:resetView:)` once it is still the image the user wants.
+    public func prepare(_ image: DecodedImage) async throws -> PreparedTexture {
+        try await factory.makeTexture(from: image.cgImage)
+    }
+
+    /// Shows an already uploaded image.
     ///
     /// The view works in the source's pixel size, so a downsampled `image` is drawn stretched
     /// to the source's footprint. Passing `resetView: false` swaps in a sharper version of the
     /// image already on screen without disturbing zoom or pan.
-    /// - Returns: The time spent converting and uploading it to the GPU.
-    @discardableResult
-    public func show(_ image: DecodedImage, resetView: Bool = true) throws -> Duration {
-        let prepared = try factory.makeTexture(from: image.cgImage)
+    public func show(_ prepared: PreparedTexture, of image: DecodedImage, resetView: Bool = true) {
         texture = prepared.texture
         (layer as? CAMetalLayer)?.colorspace = prepared.colorSpace
         if resetView {
@@ -72,7 +67,6 @@ public final class MetalCanvasView: MTKView {
                                           height: image.sourcePixelSize.height))
         }
         changed()
-        return prepared.uploadDuration
     }
 
     public func clear() {
@@ -106,22 +100,22 @@ public final class MetalCanvasView: MTKView {
     public override func draw(_ dirtyRect: NSRect) {
         guard let pass = currentRenderPassDescriptor,
               let drawable = currentDrawable,
-              let buffer = commandQueue.makeCommandBuffer(),
+              let buffer = renderer.commandQueue.makeCommandBuffer(),
               let encoder = buffer.makeRenderCommandEncoder(descriptor: pass)
         else { return }
 
         if let texture {
-            var rect = transform.clipRect
-            encoder.setRenderPipelineState(pipeline)
-            encoder.setVertexBytes(&rect, length: MemoryLayout<SIMD4<Float>>.stride, index: 0)
-            encoder.setFragmentTexture(texture, index: 0)
-            encoder.setFragmentSamplerState(transform.showsPixelGrid ? pixelSampler : smoothSampler, index: 0)
-            encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+            renderer.encode(into: encoder, texture: texture, transform: transform)
         }
         encoder.endEncoding()
 
-        if texture != nil, let callback = onImageFrameCompleted {
-            buffer.addCompletedHandler { _ in
+        // Take the callback now, so a second draw before this frame is presented cannot attach it
+        // again. It fires once, when the display has handled the frame. It must not wait for
+        // `presentedTime` to be non-zero: that is 0 whenever the window is occluded or off screen
+        // (measured), and retrying until it is would redraw an invisible window forever.
+        if texture != nil, let callback = onImageFramePresented {
+            onImageFramePresented = nil
+            drawable.addPresentedHandler { _ in
                 Task { @MainActor in callback() }
             }
         }

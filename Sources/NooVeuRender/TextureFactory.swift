@@ -9,21 +9,23 @@ public enum TextureError: Error, Sendable {
 }
 
 /// A GPU texture ready to draw, with the colour space its values are encoded in.
-public struct PreparedTexture {
+public struct PreparedTexture: @unchecked Sendable {
     public let texture: MTLTexture
     public let colorSpace: CGColorSpace
     /// Time spent converting (if needed) and uploading.
     public let uploadDuration: Duration
 }
 
-/// Turns decoded bitmaps into mipmapped GPU textures.
+/// Turns decoded bitmaps into mipmapped GPU textures, off the main thread.
 ///
 /// 8-bit RGB images go up as they are and the layer is tagged with their colour space, so
 /// macOS colour-manages them to the display. Everything else (greyscale, CMYK, indexed,
 /// 16-bit) is first redrawn into 8-bit Display P3. Wide-gamut and HDR handling at full
 /// precision is phase 1 work.
-@MainActor
-public final class TextureFactory {
+///
+/// `MTKTextureLoader` is safe to call from any thread and `MTLDevice` is immutable here, so
+/// the factory is shared freely.
+public final class TextureFactory: @unchecked Sendable {
     public let device: MTLDevice
     private let loader: MTKTextureLoader
 
@@ -33,7 +35,11 @@ public final class TextureFactory {
         self.loader = MTKTextureLoader(device: device)
     }
 
-    public func makeTexture(from image: CGImage) throws -> PreparedTexture {
+    /// Converts (when needed) and uploads `image`, including the GPU's mipmap generation, and
+    /// returns when the texture is ready to draw. Runs on a background executor: the main
+    /// thread is free while a 100 MP image goes up.
+    @concurrent
+    public func makeTexture(from image: CGImage) async throws -> PreparedTexture {
         let clock = ContinuousClock()
         let start = clock.now
 
@@ -45,16 +51,16 @@ public final class TextureFactory {
 
         let texture: MTLTexture
         do {
-            texture = try loader.newTexture(cgImage: source, options: Self.loaderOptions)
+            texture = try await loader.newTexture(cgImage: source, options: Self.loaderOptions)
         } catch {
             // The loader rejects some pixel layouts; a redraw always yields one it accepts.
             (source, colorSpace) = try Self.redrawAsDisplayP3(image)
-            texture = try loader.newTexture(cgImage: source, options: Self.loaderOptions)
+            texture = try await loader.newTexture(cgImage: source, options: Self.loaderOptions)
         }
         return PreparedTexture(texture: texture, colorSpace: colorSpace!, uploadDuration: clock.now - start)
     }
 
-    private static let loaderOptions: [MTKTextureLoader.Option: Any] = [
+    nonisolated(unsafe) private static let loaderOptions: [MTKTextureLoader.Option: Any] = [
         .SRGB: false,
         .allocateMipmaps: true,
         .generateMipmaps: true,

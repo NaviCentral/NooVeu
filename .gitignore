@@ -7,3 +7,4 @@ build/
 DerivedData/
 Corpus/generated/
 bench-*.json
+.vscode/

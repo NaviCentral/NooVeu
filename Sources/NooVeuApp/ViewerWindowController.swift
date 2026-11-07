@@ -6,27 +6,25 @@ import NooVeuRender
 @MainActor
 final class ViewerWindowController: NSWindowController, NSWindowDelegate {
     var onClose: (() -> Void)?
-    /// Called once, when the first image has been drawn.
+    /// Called once, when the first image has been presented on screen.
     var onFirstImageFrame: (() -> Void)?
 
     private let canvas: MetalCanvasView
     private let scheduler: DecodeScheduler
-    private var listing: FolderListing?
-    private var currentIndex: Int?
+    private var flip = FlipState()
     private var currentURL: URL?
     /// The file `shown` came from. Differs from `currentURL` while the next image loads.
     private var shownURL: URL?
     /// Bumped on every `display`; work started for an earlier image checks it before landing.
     private var generation = 0
-    private var direction = 1
+    /// The generation whose full-resolution upgrade failed; it is not retried on every pan.
+    private var upgradeFailedFor = -1
     private var loadTask: Task<Void, Never>?
     private var upgradeTask: Task<Void, Never>?
+    private var preloadTask: Task<Void, Never>?
     private var shown: (image: DecodedImage, upload: Duration)?
     private var errorMessage: String?
 
-    /// How far ahead (in the direction of travel) and behind to preload.
-    private let preloadAhead = 3
-    private let preloadBehind = 1
     /// Longest side, in pixels, of the largest connected display. First views are decoded to
     /// about this size, which is much faster than full resolution for big photos; a full
     /// decode follows when the user zooms in.
@@ -87,34 +85,24 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate {
                 try? isFolder ? FolderNavigator.listing(of: url) : FolderNavigator.listing(containing: url)
             }.value
             guard let self, let listing else { return }
-            self.listing = listing
+            self.flip.setListing(listing, current: isFolder ? nil : url)
             if isFolder {
-                if listing.isEmpty {
+                guard let first = self.flip.jumpToFirst() else {
                     self.window?.title = url.lastPathComponent
                     self.window?.subtitle = "No images in this folder"
-                } else {
-                    self.show(index: 0)
+                    return
                 }
-            } else {
-                self.currentIndex = listing.index(of: url)
-                self.preloadNeighbours()
-                self.updateSubtitle()
+                self.display(first)
             }
+            self.preloadNeighbours()
+            self.updateSubtitle()
         }
     }
 
-    private func show(index: Int) {
-        guard let listing, listing.items.indices.contains(index) else { return }
-        currentIndex = index
-        display(listing.items[index])
+    private func go(to url: URL?) {
+        guard let url else { return }
+        display(url)
         preloadNeighbours()
-    }
-
-    private func step(_ delta: Int) {
-        guard let listing, let currentIndex,
-              let next = listing.index(currentIndex, offsetBy: delta, wrapping: true) else { return }
-        direction = delta >= 0 ? 1 : -1
-        show(index: next)
     }
 
     private func display(_ url: URL) {
@@ -128,16 +116,19 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate {
         loadTask = Task { [weak self, scheduler, options = firstViewOptions] in
             do {
                 let image = try await scheduler.image(for: url, options: options, priority: .visible)
-                guard !Task.isCancelled, let self else { return }
+                guard let self, !Task.isCancelled else { return }
+                // The upload runs off the main thread; the user may move on while it does.
+                let prepared = try await self.canvas.prepare(image)
+                guard !Task.isCancelled else { return }
+
                 self.armFirstFrameCallback()
                 self.errorMessage = nil
                 self.window?.title = url.lastPathComponent
                 self.window?.representedURL = url
                 // Set before showing: showing triggers `transformChanged`, which reads it.
-                self.shown = (image, .zero)
+                self.shown = (image, prepared.uploadDuration)
                 self.shownURL = url
-                let upload = try self.canvas.show(image)
-                self.shown = (image, upload)
+                self.canvas.show(prepared, of: image)
                 self.updateSubtitle()
             } catch is CancellationError {
                 return
@@ -155,19 +146,21 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private func preloadNeighbours() {
-        guard let listing, let currentIndex else { return }
-        let ahead = direction > 0 ? preloadAhead : preloadBehind
-        let behind = direction > 0 ? preloadBehind : preloadAhead
-        let urls = listing.preloadOrder(around: currentIndex, ahead: ahead, behind: behind, wrapping: true)
-            .map { listing.items[$0] }
-        Task { [scheduler, options = firstViewOptions] in await scheduler.preload(urls, options: options) }
+        let urls = flip.preloadURLs
+        // Each call waits for the one before it, so under fast flipping an older list can never
+        // reach the scheduler after a newer one and drop what the newer one wants.
+        let previous = preloadTask
+        preloadTask = Task { [scheduler, options = firstViewOptions] in
+            await previous?.value
+            await scheduler.preload(urls, options: options)
+        }
     }
 
     /// Replaces a downsampled first view with the full-resolution decode once the user zooms in
     /// past what the smaller texture can show sharply. The view (zoom and pan) is untouched,
     /// because it works in source pixels.
     private func considerUpgrade() {
-        guard upgradeTask == nil, let shown, let url = currentURL, shownURL == url,
+        guard upgradeTask == nil, upgradeFailedFor != generation, let shown, let url = currentURL, shownURL == url,
               UpgradePolicy.shouldUpgrade(
                 textureLongestSide: shown.image.pixelSize.longestSide,
                 sourceLongestSide: shown.image.sourcePixelSize.longestSide,
@@ -177,31 +170,35 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate {
         let generation = self.generation
         upgradeTask = Task { [weak self, scheduler] in
             let full = try? await scheduler.image(for: url, options: .fullResolution, priority: .visible)
-            // A newer image was opened meanwhile; this work belongs to the old one.
+            var prepared: PreparedTexture?
+            if let full, let self, self.generation == generation {
+                prepared = try? await self.canvas.prepare(full)
+            }
+            // A newer image was opened meanwhile; this work belongs to the old one. The task
+            // stays registered until here, so no second upgrade starts during the upload.
             guard let self, self.generation == generation else { return }
             self.upgradeTask = nil
-            guard !Task.isCancelled, let full, let previous = self.shown else { return }
+            guard !Task.isCancelled else { return }
+            guard let full, let prepared, let previous = self.shown else {
+                self.upgradeFailedFor = generation
+                return
+            }
 
             // The file may have been saved over with a different size: start the view afresh.
             let sameShape = full.sourcePixelSize == previous.image.sourcePixelSize
             // Set before showing: showing triggers `transformChanged`, which reads it, and must
             // see an image that needs no further upgrade.
-            self.shown = (full, .zero)
-            do {
-                let upload = try self.canvas.show(full, resetView: !sameShape)
-                self.shown = (full, upload)
-                self.updateSubtitle()
-            } catch {
-                self.shown = previous
-            }
+            self.shown = (full, prepared.uploadDuration)
+            self.canvas.show(prepared, of: full, resetView: !sameShape)
+            self.updateSubtitle()
         }
     }
 
     private func armFirstFrameCallback() {
         guard let callback = onFirstImageFrame else { return }
         onFirstImageFrame = nil
-        canvas.onImageFrameCompleted = { [weak canvas] in
-            canvas?.onImageFrameCompleted = nil
+        canvas.onImageFramePresented = { [weak canvas] in
+            canvas?.onImageFramePresented = nil
             callback()
         }
     }
@@ -215,8 +212,8 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate {
 
     private func updateSubtitle() {
         var parts: [String] = []
-        if let listing, let currentIndex {
-            parts.append("\(currentIndex + 1) / \(listing.count)")
+        if let position = flip.position {
+            parts.append("\(position.number) / \(position.count)")
         }
         if let shown {
             parts.append(shown.image.sourcePixelSize.description)
@@ -241,13 +238,13 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate {
 
         switch Int(scalar.value) {
         case NSRightArrowFunctionKey, NSDownArrowFunctionKey, NSPageDownFunctionKey, 0x20:
-            step(+1)
+            go(to: flip.step(+1))
         case NSLeftArrowFunctionKey, NSUpArrowFunctionKey, NSPageUpFunctionKey, 0x7F:
-            step(-1)
+            go(to: flip.step(-1))
         case NSHomeFunctionKey:
-            show(index: 0)
+            go(to: flip.jumpToFirst())
         case NSEndFunctionKey:
-            if let listing { show(index: listing.count - 1) }
+            go(to: flip.jumpToLast())
         case 0x1B where window?.styleMask.contains(.fullScreen) == true:
             window?.toggleFullScreen(nil)
         default:
@@ -269,10 +266,10 @@ final class ViewerWindowController: NSWindowController, NSWindowDelegate {
 
     // MARK: Menu actions (reached through the responder chain)
 
-    @objc func nextImage(_ sender: Any?) { step(+1) }
-    @objc func previousImage(_ sender: Any?) { step(-1) }
-    @objc func firstImage(_ sender: Any?) { show(index: 0) }
-    @objc func lastImage(_ sender: Any?) { if let listing { show(index: listing.count - 1) } }
+    @objc func nextImage(_ sender: Any?) { go(to: flip.step(+1)) }
+    @objc func previousImage(_ sender: Any?) { go(to: flip.step(-1)) }
+    @objc func firstImage(_ sender: Any?) { go(to: flip.jumpToFirst()) }
+    @objc func lastImage(_ sender: Any?) { go(to: flip.jumpToLast()) }
     @objc func zoomIn(_ sender: Any?) { canvas.zoom(by: 1.25) }
     @objc func zoomOut(_ sender: Any?) { canvas.zoom(by: 0.8) }
     @objc func actualPixels(_ sender: Any?) { canvas.zoomToActualPixels() }
