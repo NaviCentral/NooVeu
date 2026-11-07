@@ -13,8 +13,11 @@ func usage() -> Never {
       nooveu-bench corpus <dir> [--quick]    generate the test corpus (--quick skips the slowest files)
       nooveu-bench run <dir> [options]       time every corpus file against the targets
         --iterations N   runs per measurement, median reported (default 5)
+        --screen N       longest side of the display, in pixels, that first views are sized for
+                         (default 3456, a 16-inch MacBook Pro; larger displays decode larger, so
+                         try 6016 for a 6K one)
         --json FILE      also write the full report as JSON
-        --enforce        exit 1 if a measured target fails or a decoded size is wrong
+        --enforce        exit 1 if a target fails, cannot be measured, or a decoded size is wrong
     """
     FileHandle.standardError.write(Data((text + "\n").utf8))
     exit(64)
@@ -23,6 +26,18 @@ func usage() -> Never {
 func value(after flag: String, in arguments: [String]) -> String? {
     guard let index = arguments.firstIndex(of: flag), arguments.indices.contains(index + 1) else { return nil }
     return arguments[index + 1]
+}
+
+/// A whole number given after `flag`, or `default` when the flag is absent. A value that is
+/// missing, not a number, or below `minimum` is an error: silently falling back would let a typo
+/// produce flattering results (`--screen 100` makes every first view trivially fast).
+func positiveInt(after flag: String, default fallback: Int, minimum: Int = 1, in arguments: [String]) -> Int {
+    guard arguments.contains(flag) else { return fallback }
+    guard let text = value(after: flag, in: arguments), let number = Int(text), number >= minimum else {
+        FileHandle.standardError.write(Data("error: \(flag) needs a whole number of at least \(minimum)\n".utf8))
+        exit(64)
+    }
+    return number
 }
 
 func log(_ message: String) {
@@ -50,17 +65,18 @@ do {
         }
 
     case "run":
-        let iterations = value(after: "--iterations", in: arguments).flatMap(Int.init) ?? 5
+        let iterations = positiveInt(after: "--iterations", default: 5, in: arguments)
         log("Benchmarking \(folder.path)")
-        let report = try Benchmark.run(corpus: folder, iterations: iterations, log: log)
+        let screenSide = positiveInt(after: "--screen", default: 3456, minimum: 512, in: arguments)
+        let report = try await Benchmark.run(corpus: folder, iterations: iterations, screenSide: screenSide, log: log)
         report.printSummary()
         if let path = value(after: "--json", in: arguments) {
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             try encoder.encode(report).write(to: URL(fileURLWithPath: path))
         }
-        if arguments.contains("--enforce") && !report.allMeasuredTargetsPass {
-            log("\nA target failed or a decoded size was wrong.")
+        if arguments.contains("--enforce") && !report.passesEnforcement {
+            log("\nA target failed or could not be measured, or a decoded size was wrong.")
             exit(1)
         }
 

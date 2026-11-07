@@ -90,35 +90,47 @@ public struct ViewTransform: Equatable, Sendable {
         clampCenter()
     }
 
+    /// The image pixel under a view point, as drawn (including the pixel snap, see `imageRectInView`).
     public func imagePoint(forViewPoint point: CGPoint) -> CGPoint {
-        CGPoint(
-            x: center.x + (point.x - viewSize.width / 2) * backingScale / zoom,
-            y: center.y - (point.y - viewSize.height / 2) * backingScale / zoom
+        let shift = snapShift()
+        return CGPoint(
+            x: center.x + (point.x - shift.width - viewSize.width / 2) * backingScale / zoom,
+            y: center.y - (point.y - shift.height - viewSize.height / 2) * backingScale / zoom
         )
     }
 
+    /// Where an image pixel is drawn, in view points (including the pixel snap).
     public func viewPoint(forImagePoint point: CGPoint) -> CGPoint {
-        CGPoint(
-            x: viewSize.width / 2 + (point.x - center.x) * zoom / backingScale,
-            y: viewSize.height / 2 - (point.y - center.y) * zoom / backingScale
+        let shift = snapShift()
+        return CGPoint(
+            x: viewSize.width / 2 + (point.x - center.x) * zoom / backingScale + shift.width,
+            y: viewSize.height / 2 - (point.y - center.y) * zoom / backingScale + shift.height
         )
     }
 
     /// The image's rectangle in view points.
     ///
-    /// At a whole-number zoom the origin is snapped to a whole device pixel. Without that, an
+    /// At a whole-number zoom the rectangle is snapped to whole device pixels. Without that, an
     /// image whose size differs from the view's by an odd number of pixels sits on a half-pixel
     /// offset, and smooth sampling blurs every pixel (a 1:1 view would not be sharp).
+    /// `viewPoint(forImagePoint:)` and `imagePoint(forViewPoint:)` include the same shift, so
+    /// hit-testing agrees with what is drawn.
     public var imageRectInView: CGRect {
-        let topLeft = viewPoint(forImagePoint: .zero)
         let width = imageSize.width * zoom / backingScale
         let height = imageSize.height * zoom / backingScale
-        var rect = CGRect(x: topLeft.x, y: topLeft.y - height, width: width, height: height)
-        if zoom >= 1, abs(zoom - zoom.rounded()) < 1e-6 {
-            rect.origin.x = (rect.origin.x * backingScale).rounded() / backingScale
-            rect.origin.y = (rect.origin.y * backingScale).rounded() / backingScale
-        }
-        return rect
+        return CGRect(x: viewPoint(forImagePoint: .zero).x,
+                      y: viewPoint(forImagePoint: CGPoint(x: 0, y: imageSize.height)).y,
+                      width: width, height: height)
+    }
+
+    /// How far the image's left and bottom edges move to land on whole device pixels; zero
+    /// unless the zoom is a whole number of at least 1.
+    private func snapShift() -> CGSize {
+        guard zoom >= 1, abs(zoom - zoom.rounded()) < 1e-6 else { return .zero }
+        let left = viewSize.width / 2 - center.x * zoom / backingScale
+        let bottom = viewSize.height / 2 - (imageSize.height - center.y) * zoom / backingScale
+        func snapped(_ value: CGFloat) -> CGFloat { (value * backingScale).rounded() / backingScale }
+        return CGSize(width: snapped(left) - left, height: snapped(bottom) - bottom)
     }
 
     /// The image's rectangle in Metal clip space as (minX, minY, maxX, maxY), each -1…1.

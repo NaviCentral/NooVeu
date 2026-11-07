@@ -28,21 +28,22 @@ public struct FolderListing: Sendable, Equatable {
         return items.indices.contains(target) ? target : nil
     }
 
-    /// Indices near `index` in the order they should be preloaded: interleaved outward,
-    /// so with `ahead: 2, behind: 1` the order is next, previous, next-but-one.
-    public func preloadOrder(around index: Int, ahead: Int, behind: Int, wrapping: Bool) -> [Int] {
+    /// Indices near `index` in the order they should be preloaded: interleaved outward, nearest
+    /// first. `ahead` counts images after `index` in the listing and `behind` images before it.
+    /// At equal distance the image in the direction of travel comes first: with
+    /// `favouringForward` the next image, otherwise the previous one.
+    /// With `ahead: 2, behind: 1` going forward the order is next, previous, next-but-one.
+    public func preloadOrder(around index: Int, ahead: Int, behind: Int, wrapping: Bool,
+                             favouringForward: Bool = true) -> [Int] {
         var order: [Int] = []
         var seen: Set<Int> = [index]
         let reach = max(ahead, behind)
         guard reach > 0 else { return [] }
         for step in 1...reach {
-            if step <= ahead, let next = self.index(index, offsetBy: step, wrapping: wrapping),
-               seen.insert(next).inserted {
-                order.append(next)
-            }
-            if step <= behind, let previous = self.index(index, offsetBy: -step, wrapping: wrapping),
-               seen.insert(previous).inserted {
-                order.append(previous)
+            let next = step <= ahead ? self.index(index, offsetBy: step, wrapping: wrapping) : nil
+            let previous = step <= behind ? self.index(index, offsetBy: -step, wrapping: wrapping) : nil
+            for candidate in favouringForward ? [next, previous] : [previous, next] {
+                if let candidate, seen.insert(candidate).inserted { order.append(candidate) }
             }
         }
         return order

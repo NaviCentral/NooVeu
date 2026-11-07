@@ -33,12 +33,40 @@ struct ViewTransformTests {
         let pointer = CGPoint(x: 600, y: 450)
         let before = transform.imagePoint(forViewPoint: pointer)
 
-        transform.setZoom(2, anchor: pointer)
+        transform.setZoom(1.7, anchor: pointer)
 
         #expect(transform.mode == .custom)
         let after = transform.viewPoint(forImagePoint: before)
         #expect(abs(after.x - pointer.x) < 0.001)
         #expect(abs(after.y - pointer.y) < 0.001)
+    }
+
+    @Test func zoomingToAWholeNumberMovesThePointerPixelByAtMostHalfADevicePixel() {
+        var transform = makeTransform()
+        let pointer = CGPoint(x: 600, y: 450)
+        let before = transform.imagePoint(forViewPoint: pointer)
+
+        transform.setZoom(2, anchor: pointer)
+
+        // Snapping the image to whole device pixels can shift it by half a device pixel (a
+        // quarter of a point on a 2x display) when the zoom lands on a whole number.
+        let after = transform.viewPoint(forImagePoint: before)
+        #expect(abs(after.x - pointer.x) <= 0.25 + 1e-9)
+        #expect(abs(after.y - pointer.y) <= 0.25 + 1e-9)
+    }
+
+    @Test func hitTestingMatchesTheDrawnRectangleAtWholeNumberZoom() {
+        // An odd-sized image: its snapped rectangle's corners must map back to image corners.
+        var transform = ViewTransform(imageSize: CGSize(width: 1001, height: 501),
+                                      viewSize: CGSize(width: 750, height: 400), backingScale: 2)
+        transform.setZoom(1)
+        let rect = transform.imageRectInView
+
+        let topLeft = transform.imagePoint(forViewPoint: CGPoint(x: rect.minX, y: rect.maxY))
+        let bottomRight = transform.imagePoint(forViewPoint: CGPoint(x: rect.maxX, y: rect.minY))
+
+        #expect(abs(topLeft.x) < 1e-6 && abs(topLeft.y) < 1e-6)
+        #expect(abs(bottomRight.x - 1001) < 1e-6 && abs(bottomRight.y - 501) < 1e-6)
     }
 
     @Test func viewAndImagePointsRoundTrip() {

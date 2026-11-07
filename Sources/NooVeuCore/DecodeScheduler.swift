@@ -25,7 +25,12 @@ public enum DecodePriority: Int, Sendable, Comparable {
 ///   so a file saved over is decoded again.
 /// - A file that failed to decode is not retried by `preload(_:)`, only by an explicit request.
 /// - Decodes block their thread, so they run on a dispatch queue (not the Swift cooperative
-///   pool), at most `maxConcurrentDecodes` at a time.
+///   pool), at most `maxConcurrentDecodes` at a time. Preloads may use all but one of those
+///   slots, so an image the user flips to starts at once instead of waiting for a running
+///   decode to finish. The guarantee covers one visible decode at a time: a decode whose viewer
+///   has moved on still holds its slot until it finishes (ImageIO cannot be interrupted). With
+///   `maxConcurrentDecodes` of 1 there is nothing to reserve, so a visible request waits for a
+///   running preload.
 ///
 /// Not yet budgeted: memory held by decodes in flight. Phase 1's tiled rendering removes the
 /// need to decode huge images whole.
@@ -85,12 +90,14 @@ public actor DecodeScheduler {
     private static let failureMemory = 256
 
     public nonisolated let maxConcurrentDecodes: Int
+    /// Preloads running at once never exceed this, leaving a slot free for visible requests.
+    public nonisolated var maxConcurrentPreloads: Int { max(1, maxConcurrentDecodes - 1) }
     public private(set) var statistics = Statistics()
 
     private let decoder: Decoder
     private var cache: LRUCache<Key, DecodedImage>
     private var pending: [(key: Key, priority: DecodePriority)] = []
-    private var running: Set<Key> = []
+    private var running: [Key: DecodePriority] = [:]
     private var waiters: [Key: [Waiter]] = [:]
     private var nextWaiterID: UInt64 = 0
     private var failed: Set<Key> = []
@@ -153,7 +160,7 @@ public actor DecodeScheduler {
             try await withCheckedThrowingContinuation { continuation in
                 // This body runs on the actor before any suspension, so the waiter is
                 // registered before a concurrent cancellation can look for it.
-                if running.contains(key) || pending.contains(where: { $0.key == key }) {
+                if running[key] != nil || pending.contains(where: { $0.key == key }) {
                     statistics.joinedInFlight += 1
                 }
                 failed.remove(key)  // an explicit request always retries
@@ -185,7 +192,7 @@ public actor DecodeScheduler {
         var queued = Set<Key>()
         var preloads: [(key: Key, priority: DecodePriority)] = []
         for key in keys where queued.insert(key).inserted {
-            if running.contains(key) || keptKeys.contains(key) || failed.contains(key) { continue }
+            if running[key] != nil || keptKeys.contains(key) || failed.contains(key) { continue }
             // Touching a cached neighbour keeps it from being evicted.
             if cache.value(for: key) != nil { continue }
             preloads.append((key, .preload))
@@ -204,7 +211,7 @@ public actor DecodeScheduler {
     // MARK: Queue
 
     private func enqueue(_ key: Key, priority: DecodePriority) {
-        if running.contains(key) { return }
+        if running[key] != nil { return }
         if let index = pending.firstIndex(where: { $0.key == key }) {
             guard priority > pending[index].priority else { return }
             pending.remove(at: index)
@@ -218,10 +225,14 @@ public actor DecodeScheduler {
     }
 
     private func pump() {
-        while running.count < maxConcurrentDecodes, !pending.isEmpty {
-            let key = pending.removeFirst().key
+        while running.count < maxConcurrentDecodes, let next = pending.first {
+            // Visible requests are always at the front, so a preload at the front means none are
+            // waiting. Keep one slot free for the next one.
+            if next.priority == .preload, runningPreloadCount >= maxConcurrentPreloads { break }
+            pending.removeFirst()
+            let key = next.key
             promoted.remove(key)
-            running.insert(key)
+            running[key] = next.priority
             statistics.decodesStarted += 1
 
             let decoder = self.decoder
@@ -232,8 +243,12 @@ public actor DecodeScheduler {
         }
     }
 
+    private var runningPreloadCount: Int {
+        running.values.reduce(0) { $0 + ($1 == .preload ? 1 : 0) }
+    }
+
     private func finish(_ key: Key, _ result: Result<DecodedImage, Error>) {
-        running.remove(key)
+        running[key] = nil
         switch result {
         case .success(let image):
             cache.insert(image, for: key, cost: image.byteCost)
