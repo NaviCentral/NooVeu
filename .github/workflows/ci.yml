@@ -57,3 +57,53 @@ jobs:
           plutil -lint build/NooVeu.app/Contents/Info.plist
           codesign --verify --strict build/NooVeu.app
           test -f build/NooVeu.app/Contents/Resources/AppIcon.icns
+
+  benchmark:
+    # Informational only. A GitHub-hosted runner is an M1-class virtual machine: the lowest-end Apple
+    # silicon available for measuring, and a noisy one (shared hardware, few cores). Its numbers
+    # show roughly how a slower Mac behaves. A missed target never fails the build; a failure to
+    # build or to produce a report is still shown (the report step is marked as failed).
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the benchmark
+        run: swift build -c release --product nooveu-bench
+
+      - name: Generate the test corpus
+        run: .build/release/nooveu-bench corpus Corpus/generated
+
+      - name: Run the benchmark
+        # Without --enforce, so a miss is reported, not fatal. `shell: bash` makes GitHub use
+        # `-o pipefail`: without it `tee` would hide a benchmark that crashed.
+        shell: bash
+        continue-on-error: true
+        run: .build/release/nooveu-bench run Corpus/generated --iterations 5 --json bench.json | tee bench.txt
+
+      - name: Summarise
+        if: always()
+        run: |
+          {
+            echo "## Benchmark on the CI runner (informational)"
+            echo
+            echo "$(sysctl -n machdep.cpu.brand_string), $(sysctl -n hw.ncpu) cores, $(( $(sysctl -n hw.memsize) / 1073741824 )) GB. Shared virtual hardware: expect noise."
+            echo
+            echo '```'
+            if [ -f bench.txt ] && grep -q '^Targets' bench.txt; then
+              sed -n '/^Targets/,$p' bench.txt
+            else
+              echo "the benchmark did not produce a report"
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark
+          path: |
+            bench.json
+            bench.txt
+          if-no-files-found: ignore

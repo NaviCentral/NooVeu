@@ -80,7 +80,8 @@ about 330 ms to launch, because PNG has no fast partial decode.
 | --- | --- |
 | `NooVeuCore` | Decoding (ImageIO), the decode scheduler and cache, folder listing, flipping logic. No UI. |
 | `NooVeuRender` | The Metal canvas, zoom and pan maths, texture upload. |
-| `NooVeuApp` | The AppKit shell: windows, menus, keyboard. |
+| `NooVeuShell` | The viewer window's logic with no AppKit in it: key bindings, the load / upgrade / flip state machine, status text. Tested with fakes. |
+| `NooVeuApp` | The AppKit shell: windows, menus, translating events. A thin layer over `NooVeuShell`. |
 | `NooVeuBench` | Test-corpus generator and benchmark harness. |
 
 See [CLAUDE.md](CLAUDE.md) for the design rules and working conventions.
