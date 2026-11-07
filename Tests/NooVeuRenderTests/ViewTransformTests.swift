@@ -210,4 +210,37 @@ struct ViewTransformTests {
         transform.setZoom(2)
         #expect(transform.showsPixelGrid)
     }
+
+    @Test func theVisibleRectAtFitIsTheWholeImage() {
+        let transform = makeTransform()
+
+        #expect(transform.visibleSourceRect == CGRect(x: 0, y: 0, width: 4000, height: 3000))
+    }
+
+    @Test func theVisibleRectFollowsZoomAndPan() {
+        var transform = makeTransform()  // 800×600 points at 2× = 1600×1200 device pixels
+        transform.setZoom(1)
+
+        // At 1:1 the view shows 1600×1200 image pixels around the centre.
+        #expect(transform.visibleSourceRect == CGRect(x: 1200, y: 900, width: 1600, height: 1200))
+
+        transform.pan(by: CGSize(width: -100, height: 0))  // drag left by 100 points: the view moves right by 200 pixels
+        #expect(transform.visibleSourceRect == CGRect(x: 1400, y: 900, width: 1600, height: 1200))
+    }
+
+    @Test func theVisibleRectNeverReachesBeyondTheImage() {
+        var transform = makeTransform()
+        transform.setZoom(0.1)  // the image is smaller than the view
+        #expect(transform.visibleSourceRect == CGRect(x: 0, y: 0, width: 4000, height: 3000))
+
+        transform.setZoom(2)
+        transform.pan(by: CGSize(width: 100_000, height: -100_000))  // clamped at the corner
+        let visible = transform.visibleSourceRect
+        #expect(visible.minX >= 0 && visible.minY >= 0 && visible.maxX <= 4000 && visible.maxY <= 3000)
+        #expect(visible.width == 800 && visible.height == 600)
+    }
+
+    @Test func theVisibleRectOfNothingIsEmpty() {
+        #expect(ViewTransform().visibleSourceRect == .zero)
+    }
 }

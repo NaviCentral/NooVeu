@@ -18,13 +18,17 @@ public final class ImageRenderer {
     public let commandQueue: MTLCommandQueue
     public let pixelFormat: MTLPixelFormat
     private let pipeline: MTLRenderPipelineState
+    private let library: MTLLibrary
+    /// Built the first time tiles are drawn: most images never need it.
+    private lazy var tilePipeline: MTLRenderPipelineState? = try? Shaders.makePipeline(library: library, pixelFormat: pixelFormat, tiles: true)
     private let smoothSampler: MTLSamplerState
     private let pixelSampler: MTLSamplerState
 
     /// Fails only when Metal is unavailable, which no Apple Silicon Mac lacks.
     public init?(device: MTLDevice, pixelFormat: MTLPixelFormat = .bgra8Unorm) {
         guard let commandQueue = device.makeCommandQueue(),
-              let pipeline = try? Shaders.makePipeline(device: device, pixelFormat: pixelFormat),
+              let library = try? Shaders.makeLibrary(device: device),
+              let pipeline = try? Shaders.makePipeline(library: library, pixelFormat: pixelFormat),
               let smooth = Shaders.makeSampler(device: device, pixelGrid: false),
               let pixel = Shaders.makeSampler(device: device, pixelGrid: true)
         else { return nil }
@@ -32,6 +36,7 @@ public final class ImageRenderer {
         self.commandQueue = commandQueue
         self.pixelFormat = pixelFormat
         self.pipeline = pipeline
+        self.library = library
         self.smoothSampler = smooth
         self.pixelSampler = pixel
     }
@@ -44,6 +49,21 @@ public final class ImageRenderer {
         encoder.setFragmentTexture(texture, index: 0)
         encoder.setFragmentSamplerState(transform.showsPixelGrid ? pixelSampler : smoothSampler, index: 0)
         encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+    }
+
+    /// Encodes tiles in the order given (later ones draw over earlier ones), each placed by its own
+    /// clip rectangle. Call after `encode` for a base texture, coarser tiles first.
+    public func encode(into encoder: MTLRenderCommandEncoder, tiles: [TileQuad], showsPixelGrid: Bool) {
+        guard !tiles.isEmpty, let tilePipeline else { return }
+        encoder.setRenderPipelineState(tilePipeline)
+        encoder.setFragmentSamplerState(showsPixelGrid ? pixelSampler : smoothSampler, index: 0)
+        for tile in tiles {
+            var rect = tile.clipRect, uv = tile.uvRect
+            encoder.setVertexBytes(&rect, length: MemoryLayout<SIMD4<Float>>.stride, index: 0)
+            encoder.setVertexBytes(&uv, length: MemoryLayout<SIMD4<Float>>.stride, index: 1)
+            encoder.setFragmentTexture(tile.texture, index: 0)
+            encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+        }
     }
 
     /// One rendered frame: its pixels, and how long the GPU spent on it.
@@ -77,6 +97,11 @@ public final class ImageRenderer {
     /// pixels, and waits for the GPU to finish. Used by tests and the benchmark; the app draws
     /// to its window instead.
     public func renderOffscreen(texture: MTLTexture, transform: ViewTransform) throws -> Frame {
+        try renderOffscreen(base: texture, tiles: [], transform: transform)
+    }
+
+    /// Renders an optional base texture and then tiles over it (see `encode(into:tiles:showsPixelGrid:)`).
+    public func renderOffscreen(base: MTLTexture?, tiles: [TileQuad], transform: ViewTransform) throws -> Frame {
         let width = Int((transform.viewSize.width * transform.backingScale).rounded())
         let height = Int((transform.viewSize.height * transform.backingScale).rounded())
         guard width > 0, height > 0 else { throw RenderError.targetUnavailable }
@@ -97,7 +122,8 @@ public final class ImageRenderer {
         guard let buffer = commandQueue.makeCommandBuffer(),
               let encoder = buffer.makeRenderCommandEncoder(descriptor: pass)
         else { throw RenderError.commandBufferUnavailable }
-        encode(into: encoder, texture: texture, transform: transform)
+        if let base { encode(into: encoder, texture: base, transform: transform) }
+        encode(into: encoder, tiles: tiles, showsPixelGrid: transform.showsPixelGrid)
         encoder.endEncoding()
         buffer.commit()
         buffer.waitUntilCompleted()

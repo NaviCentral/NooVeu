@@ -229,12 +229,43 @@ struct TileLoaderTests {
         let (loader, received, _) = makeLoader(source)
         await loader.want([id(0)])
         try await eventually("first delivery") { received.count(id(0)) == 1 }
+        await loader.want([id(0)], alreadyHeld: [id(0)])  // the view reports holding it
 
         await loader.want([id(0)])  // the GPU evicted it and the view needs it again
         try await eventually("second delivery") { received.count(id(0)) == 2 }
 
         #expect(source.count(id(0)) == 1)
         #expect(await loader.statistics.cacheHits == 1)
+    }
+
+    @Test func aTileDeliveredButNotYetReportedHeldIsNotDeliveredAgain() async throws {
+        let source = FakeTileSource()
+        let (loader, received, _) = makeLoader(source)
+        await loader.want([id(0)])
+        try await eventually("delivered") { received.count(id(0)) == 1 }
+
+        // The upload is under way, so the view cannot list it yet; it keeps asking.
+        for _ in 0..<50 { await loader.want([id(0), id(1)]) }
+        try await eventually("1 delivered") { received.count(id(1)) == 1 }
+        try await Task.sleep(for: .milliseconds(40))
+
+        #expect(received.count(id(0)) == 1, "not delivered again while its upload is pending")
+        #expect(received.count(id(1)) == 1)
+        #expect(await loader.statistics.cacheHits == 0)
+    }
+
+    @Test func aTileThatLeavesTheWantedSetLosesThatProtection() async throws {
+        let source = FakeTileSource()
+        let (loader, received, _) = makeLoader(source)
+        await loader.want([id(0)])
+        try await eventually("delivered") { received.count(id(0)) == 1 }
+        await loader.want([id(1)])  // the view moved away before reporting 0 held
+        try await eventually("1 delivered") { received.count(id(1)) == 1 }
+
+        await loader.want([id(0)])  // and came back, and 0 is not on the GPU
+
+        try await eventually("0 delivered again") { received.count(id(0)) == 2 }
+        #expect(source.count(id(0)) == 1, "from the cache, not decoded again")
     }
 
     @Test func aTileTheViewAlreadyHoldsIsNeitherDeliveredNorDecoded() async throws {
