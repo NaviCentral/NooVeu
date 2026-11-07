@@ -39,6 +39,21 @@ shell) uses all three and stays thin; `NooVeuBench` uses Core and Render.
   decode whose viewer moved on cannot be interrupted and keeps its slot). Use
   `FolderNavigator.canonical` for any URL that becomes a cache key. The cache is emptied on system
   memory pressure.
+- **Large images are served in tiles** (`Sources/NooVeuCore/Tiling/`; the renderer and viewer use it
+  from slice 1.2b/1.2c). `TileGrid` is pure geometry (pyramid levels, tile areas with a 1 px border so
+  smooth sampling shows no seams, which level suits a zoom). A `TileSource` produces tile bitmaps:
+  `BufferTileSource` decodes the image once into a buffer we own (JPEG, PNG and everything ImageIO
+  cannot decode a region of: JPEG's first tile otherwise decodes the whole image and ImageIO caches it
+  invisibly, and PNG decodes everything for every tile); `RegionTileSource` decodes a region from the
+  file on demand (HEIC and AVIF, about 10 ms a tile at any size; crops start on a 64 px boundary
+  because the codec's chroma interpolation depends on where a crop starts). Coarse levels are scaled
+  with `.medium` interpolation, never `.high`: the high filter's output near a crop's edge depends on
+  how the crop was cut, so neighbouring tiles disagree along their border and seams show (the noise
+  seam test guards this). `TileSourceFactory` picks
+  one, checks the region source's first tile is fast, and holds an image too big for the buffer budget
+  at reduced detail (`detailFactor`). `TileLoader` turns "these tiles are wanted now" into decodes:
+  nearest first, a few at a time, dropping what the view has left, caching, never retrying a failure.
+  Only images with a longest side above 8192 px are tiled (`LargeImagePolicy`).
 - **Upgrade to full resolution at most once per displayed image.** A full-resolution request can
   come back no larger than the texture on screen (very wide JPEGs are subsampled to stay within
   the GPU's 16384 px texture limit), so "is anything sharper available" cannot be assumed.
