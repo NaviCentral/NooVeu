@@ -173,8 +173,7 @@ struct ViewTransformTests {
         #expect(rect.width * 2 == 1001)
     }
 
-    @Test func aSharperTextureOfTheSameImageDoesNotMoveTheView() {
-        // The view works in source pixels, so swapping the texture changes nothing here.
+    @Test func resizingToTheSameSizeChangesNothing() {
         var transform = makeTransform()
         transform.setZoom(1.3, anchor: CGPoint(x: 300, y: 200))
         let before = transform

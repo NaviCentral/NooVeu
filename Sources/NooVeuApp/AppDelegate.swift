@@ -7,16 +7,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Shared by every window, so a file open in two windows is decoded once.
     private let scheduler = DecodeScheduler()
     private var controllers: [ViewerWindowController] = []
+    /// Where the next window's top-left goes, so windows cascade instead of stacking exactly.
+    private var cascadePoint = NSPoint.zero
     private let launchProbe = LaunchProbe.isEnabled
+    /// Empties the decode cache when the system runs short of memory.
+    private var memoryPressure: DispatchSourceMemoryPressure?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        let pressure = DispatchSource.makeMemoryPressureSource(eventMask: [.warning, .critical], queue: .main)
+        pressure.setEventHandler { [scheduler] in
+            Task { await scheduler.purge() }
+        }
+        pressure.resume()
+        memoryPressure = pressure
+
         // Files passed on the command line; Finder opens arrive through application(_:open:).
         let urls = CommandLine.arguments.dropFirst()
             .filter { !$0.hasPrefix("-") && FileManager.default.fileExists(atPath: $0) }
             .map { URL(fileURLWithPath: $0) }
         // A launch probe with nothing to show must still end, so scripts never hang.
         if launchProbe { LaunchProbe.armTimeout() }
-        urls.forEach(openWindow)
+        openWindows(for: urls)
 
         if controllers.isEmpty && !launchProbe {
             openDocument(nil)
@@ -27,7 +38,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func application(_ application: NSApplication, open urls: [URL]) {
-        urls.forEach(openWindow)
+        openWindows(for: urls)
+    }
+
+    /// One window per folder, not per file: a window flips through its whole folder.
+    private func openWindows(for urls: [URL]) {
+        OpenPlan.windows(for: urls).forEach(openWindow)
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -55,6 +71,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         controllers.append(controller)
         controller.showWindow(nil)
+        // The first window stays centred (a zero point leaves it where it is); later ones step
+        // down and to the right.
+        if let window = controller.window {
+            cascadePoint = window.cascadeTopLeft(from: cascadePoint)
+        }
         controller.open(url)
     }
 }

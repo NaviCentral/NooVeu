@@ -114,6 +114,13 @@ struct FlipStateTests {
         #expect(state.jumpToLast() == nil)
     }
 
+    @Test func aHugeStepDoesNotTrap() {
+        var state = state(10, at: 3)
+
+        #expect(state.step(Int.max) != nil)
+        #expect(state.index != nil)
+    }
+
     @Test func anEmptyListingHasNoImages() {
         var state = FlipState()
         state.setListing(listing(0), current: nil)

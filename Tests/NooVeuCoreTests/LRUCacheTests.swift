@@ -47,4 +47,25 @@ struct LRUCacheTests {
         cache.removeAll()
         #expect(cache.count == 0 && cache.totalCost == 0)
     }
+
+    @Test func aMissReturnsNothingAndAZeroLimitKeepsOnlyTheNewestEntry() {
+        var cache = LRUCache<String, Int>(costLimit: 0)
+
+        #expect(cache.value(for: "none") == nil)
+        cache.insert(1, for: "a", cost: 5)
+        cache.insert(2, for: "b", cost: 5)
+
+        #expect(cache.count == 1 && cache.contains("b"))
+    }
+
+    @Test func replacingAnEntryWithABiggerOneEvictsOthers() {
+        var cache = LRUCache<String, Int>(costLimit: 30)
+        cache.insert(1, for: "a", cost: 10)
+        cache.insert(2, for: "b", cost: 10)
+
+        let evicted = cache.insert(3, for: "b", cost: 25)
+
+        #expect(evicted == ["a"])
+        #expect(cache.totalCost == 25)
+    }
 }

@@ -91,7 +91,9 @@ private enum BenchError: Error, CustomStringConvertible {
 /// Launch time and memory at rest need the running app: `scripts/measure-launch.sh`.
 @MainActor
 enum Benchmark {
-    static let thumbnailSide = 256
+    /// A grid cell's size in pixels. (An embedded camera preview is about 160 px: bigger cells
+    /// would make `ImageDecoder.thumbnail` decode the image instead of using it.)
+    static let thumbnailSide = 128
     /// Thumbnails in the first screen of a grid.
     static let gridThumbnails = 60
     /// 120 Hz, the fastest display a Mac has.
@@ -102,6 +104,7 @@ enum Benchmark {
             CorpusManifest.self,
             from: Data(contentsOf: root.appendingPathComponent("manifest.json"))
         )
+        let manifestFiles = Set(manifest.entries.map(\.file))
         let device = MTLCreateSystemDefaultDevice()
         let factory = device.flatMap { TextureFactory(device: $0) }
         let renderer = device.flatMap { ImageRenderer(device: $0) }
@@ -166,9 +169,9 @@ enum Benchmark {
 
         log("Frames, uploads and thumbnails")
         var targets = firstViewTargets(from: files)
-        targets += await gpuTargets(root: root, factory: factory, renderer: renderer,
+        targets += await gpuTargets(root: root, manifestFiles: manifestFiles, factory: factory, renderer: renderer,
                                     iterations: iterations, screenSide: screenSide)
-        targets += await thumbnailTargets(root: root, iterations: max(iterations, 5))
+        targets += await thumbnailTargets(root: root, manifestFiles: manifestFiles, iterations: max(iterations, 5))
 
         return BenchReport(
             machine: machineDescription(),
@@ -221,7 +224,8 @@ enum Benchmark {
     }
 
     private static func gpuTargets(
-        root: URL, factory: TextureFactory?, renderer: ImageRenderer?, iterations: Int, screenSide: Int
+        root: URL, manifestFiles: Set<String>, factory: TextureFactory?, renderer: ImageRenderer?,
+        iterations: Int, screenSide: Int
     ) async -> [TargetResult] {
         let large = root.appendingPathComponent("large")
         var results: [TargetResult] = []
@@ -229,10 +233,11 @@ enum Benchmark {
             guard let factory, let renderer else { throw BenchError.noMetal }
             return (factory, renderer)
         }
+        // Only files the manifest lists: a corpus regenerated with `--quick` over an older full one
+        // must not be measured through stale files left on disk.
         func existing(_ name: String) throws -> URL {
-            let url = large.appendingPathComponent(name)
-            guard FileManager.default.fileExists(atPath: url.path) else { throw BenchError.missing("large/\(name)") }
-            return url
+            guard manifestFiles.contains("large/\(name)") else { throw BenchError.missing("large/\(name)") }
+            return large.appendingPathComponent(name)
         }
         let panel = viewTransform(imageSize: PixelSize(width: 0, height: 0), screenSide: screenSide).viewSize
 
@@ -250,7 +255,8 @@ enum Benchmark {
             }.median
         })
 
-        // Frame time while zooming and panning: median GPU time of one fitted frame.
+        // Frame time: median GPU time of one fitted (zoomed-out) frame. Zoomed frames, the
+        // pixel-grid sampler and CPU time are not measured; the margin here is 20 to 40 times.
         for (name, file, options) in [
             ("Frame time, fit view, 100 MP JPEG at display size", "jpeg-100mp.jpg", DecodeOptions.fitting(screenSide)),
             ("Frame time, fit view, full-size 100 MP JPEG", "jpeg-100mp.jpg", DecodeOptions.fullResolution),
@@ -300,12 +306,18 @@ enum Benchmark {
         return results
     }
 
-    /// An 8-bit BGRA copy of `image`, drawn fresh: a bitmap that is certainly fully decoded.
+    /// A copy of `image` drawn fresh into an 8-bit bitmap with the SAME pixel layout: a bitmap that
+    /// is certainly fully decoded, and that costs the same to upload as the original if the original
+    /// has no decode pending. (Comparing against a different layout, BGRA against RGBA, made the
+    /// ratio sit near its limit for HEIC.)
     private static func plainBitmap(of image: CGImage) -> CGImage? {
         let space = image.colorSpace?.model == .rgb ? image.colorSpace! : CGColorSpace(name: CGColorSpace.displayP3)!
+        let bitmapInfo = image.isMetalUploadable
+            ? image.bitmapInfo.rawValue
+            : CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
         guard let context = CGContext(
             data: nil, width: image.width, height: image.height, bitsPerComponent: 8, bytesPerRow: 0, space: space,
-            bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
+            bitmapInfo: bitmapInfo
         ) else { return nil }
         context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
         return context.makeImage()
@@ -323,16 +335,20 @@ enum Benchmark {
 
     /// The first screen of a thumbnail grid. Two cases, because they differ tenfold: camera files
     /// carry a small preview inside, which needs no decoding; files without one must be decoded.
-    private static func thumbnailTargets(root: URL, iterations: Int) async -> [TargetResult] {
+    private static func thumbnailTargets(root: URL, manifestFiles: Set<String>, iterations: Int) async -> [TargetResult] {
         let large = root.appendingPathComponent("large")
+        func need(_ name: String) throws -> URL {
+            guard manifestFiles.contains("large/\(name)") else { throw BenchError.missing("large/\(name)") }
+            return large.appendingPathComponent(name)
+        }
         return [
             await attempt("Thumbnail grid, first screen (embedded previews)", budget: 500,
                           basis: "decode only, \(gridThumbnails) reads of one warm file; its embedded preview is 160 px, so this shows previews cost almost nothing, not a whole grid") {
-                try thumbnailGrid(file: large.appendingPathComponent("jpeg-24mp-thumb.jpg"), parallelism: 4, iterations: iterations)
+                try thumbnailGrid(file: try need("jpeg-24mp-thumb.jpg"), parallelism: 4, iterations: iterations)
             },
             await attempt("Thumbnail grid, first screen (no preview, worst case)", budget: 500,
                           basis: "decode only, \(gridThumbnails) decodes of one warm 24 MP JPEG, 8 at a time (thumbnail concurrency is a phase 2 decision)") {
-                try thumbnailGrid(file: large.appendingPathComponent("jpeg-24mp.jpg"), parallelism: 8, iterations: iterations)
+                try thumbnailGrid(file: try need("jpeg-24mp.jpg"), parallelism: 8, iterations: iterations)
             },
         ]
     }
@@ -435,7 +451,7 @@ enum Benchmark {
 
 extension BenchReport {
     func printSummary() {
-        func ms(_ value: Double?) -> String { value.map { String(format: "%.1f", $0) } ?? "–" }
+        func ms(_ value: Double?, decimals: Int = 1) -> String { value.map { String(format: "%.\(decimals)f", $0) } ?? "–" }
         func pad(_ text: String, _ width: Int) -> String {
             text.count >= width ? text : text + String(repeating: " ", count: width - text.count)
         }
@@ -468,7 +484,7 @@ extension BenchReport {
             }
             let limit = target.budget < 10 ? String(format: "%.1f", target.budget) : String(Int(target.budget))
             print("  " + pad(target.name, 58) + pad("≤ \(limit) \(target.unit)", 11)
-                  + pad(ms(target.measured), 8) + pad(verdict, 14) + target.basis)
+                  + pad(ms(target.measured, decimals: target.unit == "×" ? 2 : 1), 8) + pad(verdict, 14) + target.basis)
             if let reason = target.knownMiss, target.passed == false {
                 print("      known miss: \(reason)" + (target.knownMissCeiling.map { " (tolerated up to \(Int($0)) \(target.unit))" } ?? ""))
             }

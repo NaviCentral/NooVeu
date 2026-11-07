@@ -17,27 +17,33 @@ public enum DecodePriority: Int, Sendable, Comparable {
 /// - Visible requests jump the queue; preloads wait behind them, nearest first.
 /// - Two requests for the same image share one decode, including a visible request that
 ///   arrives while a preload of the same image is already running.
-/// - A request whose task is cancelled leaves the queue. A decode that has already started
-///   runs to completion (ImageIO cannot be interrupted) and its result is cached.
+/// - A visible request whose task is cancelled leaves the queue (a decode that began as a preload
+///   goes back to being one). A cancelled request made with `.preload` priority stays queued as a
+///   preload until the next `preload(_:)` call keeps or drops it. A decode that has already started
+///   runs to completion and its result is cached.
 /// - `preload(_:)` drops queued preloads the user has moved away from, so fast flipping
 ///   never builds a backlog.
 /// - Cache entries are keyed by the file's modification time and size as well as its path,
-///   so a file saved over is decoded again.
+///   so a file saved over is decoded again. Paths are used as given: pass canonical URLs
+///   (`FolderNavigator.canonical`), or `/tmp/a.jpg` and `/private/tmp/a.jpg` are two entries.
+///   (The modification time is read with `stat` on the scheduler's own actor, so a hung network
+///   volume stalls every call, cache hits included.)
 /// - A file that failed to decode is not retried by `preload(_:)`, only by an explicit request.
 /// - Decodes block their thread, so they run on a dispatch queue (not the Swift cooperative
-///   pool), at most `maxConcurrentDecodes` at a time. Preloads may use all but one of those
-///   slots, so an image the user flips to starts at once instead of waiting for a running
-///   decode to finish. The guarantee covers one visible decode at a time: a decode whose viewer
-///   has moved on still holds its slot until it finishes (ImageIO cannot be interrupted). With
-///   `maxConcurrentDecodes` of 1 there is nothing to reserve, so a visible request waits for a
-///   running preload.
+///   pool). Preloads use at most `maxConcurrentDecodes - 1` slots, so an image the user flips to
+///   starts at once instead of waiting behind background work. A decode whose viewer has moved on
+///   cannot be interrupted (ImageIO offers no way) and keeps its slot until it finishes, so under
+///   fast flipping visible requests may also start in two burst slots beyond the limit: total
+///   decodes never exceed `maxConcurrentDecodes + 2`. With `maxConcurrentDecodes` of 1 there is
+///   nothing to reserve, but a visible request still starts at once, as a burst.
 ///
 /// Not yet budgeted: memory held by decodes in flight. Phase 1's tiled rendering removes the
 /// need to decode huge images whole.
 public actor DecodeScheduler {
     public typealias Decoder = @Sendable (URL, DecodeOptions) throws -> DecodedImage
 
-    /// Identifies a file's contents for caching: its path, when it was last written, and its size.
+    /// Identifies a file's contents for caching: when it was last written, and its size. (`Key`
+    /// adds the path.)
     struct FileStamp: Hashable, Sendable {
         var seconds = 0
         var nanoseconds = 0
@@ -88,6 +94,8 @@ public actor DecodeScheduler {
         label: "ch.navicentral.nooveu.decode", qos: .userInitiated, attributes: .concurrent
     )
     private static let failureMemory = 256
+    /// Extra decodes a visible request may start beyond `maxConcurrentDecodes`.
+    private static let burstSlots = 2
 
     public nonisolated let maxConcurrentDecodes: Int
     /// Preloads running at once never exceed this, leaving a slot free for visible requests.
@@ -105,7 +113,7 @@ public actor DecodeScheduler {
     private var promoted: Set<Key> = []
 
     public init(
-        costLimit: Int = DecodeScheduler.defaultCostLimit(),
+        costLimit: Int = DecodeScheduler.defaultCostLimit,
         maxConcurrentDecodes: Int = DecodeScheduler.defaultConcurrency(),
         decoder: @escaping Decoder = { url, options in try ImageDecoder.decode(url, options: options) }
     ) {
@@ -114,12 +122,14 @@ public actor DecodeScheduler {
         self.decoder = decoder
     }
 
-    /// An eighth of installed memory, between 256 MB and 2 GB: about ten 24-megapixel
-    /// images on an 8 GB Mac and twenty on a 16 GB one.
-    public static func defaultCostLimit(physicalMemory: UInt64 = ProcessInfo.processInfo.physicalMemory) -> Int {
-        let eighth = Int(clamping: physicalMemory / 8)
-        return min(max(eighth, 256 << 20), 2 << 30)
-    }
+    /// The decode cache's working-set budget: 512 MB on every Mac, however much memory it has.
+    ///
+    /// This holds the image on screen and its preloaded neighbours (about five decoded
+    /// photos). It is deliberately separate from the app's own footprint (the 80 MB target is for
+    /// the bare app), and flat rather than a share of installed memory, so behaviour and
+    /// measurements are the same on every machine. Revisit once there is a thumbnail browser,
+    /// which will want a budget of its own.
+    public static let defaultCostLimit = 512 << 20
 
     /// Half the cores, between 2 and 4.
     public static func defaultConcurrency(cores: Int = ProcessInfo.processInfo.activeProcessorCount) -> Int {
@@ -225,9 +235,12 @@ public actor DecodeScheduler {
     }
 
     private func pump() {
-        while running.count < maxConcurrentDecodes, let next = pending.first {
+        while let next = pending.first {
             // Visible requests are always at the front, so a preload at the front means none are
-            // waiting. Keep one slot free for the next one.
+            // waiting. Preloads stay within the limit and leave a slot free; a visible request may
+            // also use the burst slots, because decodes whose viewer has moved on still hold theirs.
+            let limit = next.priority == .visible ? maxConcurrentDecodes + Self.burstSlots : maxConcurrentDecodes
+            guard running.count < limit else { break }
             if next.priority == .preload, runningPreloadCount >= maxConcurrentPreloads { break }
             pending.removeFirst()
             let key = next.key

@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    # `edited` re-checks the title and body, which end up in the squashed commit message.
+    types: [opened, synchronize, reopened, edited]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    # Apple Silicon, macOS 26: the only platform NooVeu supports.
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+
+      - name: Project rules, files
+        run: scripts/check-names.sh
+
+      - name: Project rules, commits and pull request text
+        if: github.event_name == 'pull_request'
+        env:
+          # Passed through the environment, never interpolated into the script.
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          scripts/check-names.sh --commits "origin/${BASE_REF}..HEAD"
+          printf '%s\n%s\n' "$PR_TITLE" "$PR_BODY" | scripts/check-names.sh --stdin
+
+      - name: Build
+        run: swift build
+
+      - name: Test
+        run: scripts/test.sh
+
+      - name: Bundle the app
+        run: scripts/bundle-app.sh
+
+      - name: Check the bundle
+        run: |
+          plutil -lint build/NooVeu.app/Contents/Info.plist
+          codesign --verify --strict build/NooVeu.app
+          test -f build/NooVeu.app/Contents/Resources/AppIcon.icns

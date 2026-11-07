@@ -61,8 +61,9 @@ struct ImageDecoderTests {
         let swapped = orientation >= 5
         let expected = Self.displayedCorners[orientation]!
 
-        // Full size takes the subsample-1 path (JPEG) or the thumbnail path (HEIC at its own
-        // size); a small target takes subsampling (JPEG) or the thumbnail path (HEIC).
+        // At full size both formats are decoded whole (subsample factor 1, the source being no
+        // larger than the target); at `.fitting(32)` JPEG is subsampled and HEIC takes the
+        // thumbnail path.
         for options in [DecodeOptions.fullResolution, .fitting(32)] {
             let image = try ImageDecoder.decode(url, options: options)
 
@@ -156,6 +157,36 @@ struct ImageDecoderTests {
         }
     }
 
+    @Test func decodeOptionsNeverHoldAnImpossibleSize() {
+        #expect(DecodeOptions(maxPixelSize: -3).maxPixelSize == 1)
+        #expect(DecodeOptions(maxPixelSize: 0).maxPixelSize == 1)
+        #expect(DecodeOptions(maxPixelSize: 500).maxPixelSize == 500)
+        #expect(DecodeOptions(maxPixelSize: nil).maxPixelSize == nil)
+        #expect(DecodeOptions.fullResolution.maxPixelSize == nil)
+    }
+
+    @Test func aThumbnailRequestOfZeroOrLessIsClampedNotUnlimited() throws {
+        let folder = try TemporaryFolder()
+        let url = TestImages.write(width: 64, height: 32, to: folder.file("a.jpg"), type: "public.jpeg")
+
+        for side in [-1, 0] {
+            #expect(try ImageDecoder.thumbnail(url, maxPixelSize: side).pixelSize.longestSide < 64, "side \(side)")
+        }
+    }
+
+    @Test func anEmbeddedPreviewIsUsedOnlyWhenItIsBigEnough() throws {
+        let folder = try TemporaryFolder()
+        let url = TestImages.write(width: 800, height: 600, to: folder.file("camera.jpg"), type: "public.jpeg",
+                                   properties: [kCGImageDestinationEmbedThumbnail: true])
+
+        let big = try ImageDecoder.thumbnail(url, maxPixelSize: 400)
+        let small = try ImageDecoder.thumbnail(url, maxPixelSize: 100)
+
+        // A camera-sized preview (about 160 px) would be blurry in a 400 px cell: decode instead.
+        #expect(big.pixelSize.longestSide >= 300, "got \(big.pixelSize)")
+        #expect(small.pixelSize.longestSide >= 75 && small.pixelSize.longestSide <= 170, "got \(small.pixelSize)")
+    }
+
     @Test func decodedJPEGIsReadyForTheGPU() throws {
         let folder = try TemporaryFolder()
         let url = TestImages.write(width: 64, height: 32, to: folder.file("a.jpg"), type: "public.jpeg")
@@ -183,6 +214,12 @@ struct DecodeStrategyTests {
     @Test func heicAndAvifUseTheThumbnailPath() {
         for type in ["public.heic", "public.avif", "public.heif"] {
             #expect(DecodeStrategy.choose(typeIdentifier: type, sourceLongestSide: 6000, target: 3456) == .thumbnail(maxPixelSize: 3456))
+        }
+    }
+
+    @Test func everyHeifFamilyTypeUsesTheThumbnailPath() {
+        for type in ["public.heics", "public.avis", "public.avci"] {
+            #expect(DecodeStrategy.choose(typeIdentifier: type, sourceLongestSide: 6000, target: 3456) == .thumbnail(maxPixelSize: 3456), "\(type)")
         }
     }
 
