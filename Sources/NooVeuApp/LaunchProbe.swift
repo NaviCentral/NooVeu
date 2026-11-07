@@ -1,5 +1,6 @@
 import AppKit
 import Darwin
+import NooVeuShell
 
 /// Measures launch to first image on screen (the 300 ms target) and memory at rest (the 80 MB
 /// target).
@@ -13,13 +14,10 @@ import Darwin
 @MainActor
 enum LaunchProbe {
     /// On when `NOOVEU_LAUNCH_PROBE` is set to anything but empty or `0`.
-    static let isEnabled: Bool = {
-        let value = ProcessInfo.processInfo.environment["NOOVEU_LAUNCH_PROBE"] ?? ""
-        return !value.isEmpty && value != "0"
-    }()
+    static let isEnabled = ProbeSettings.isEnabled(ProcessInfo.processInfo.environment["NOOVEU_LAUNCH_PROBE"])
 
     private static var settleSeconds: Double {
-        ProcessInfo.processInfo.environment["NOOVEU_PROBE_SETTLE_SECONDS"].flatMap(Double.init) ?? 3
+        ProbeSettings.settleSeconds(ProcessInfo.processInfo.environment["NOOVEU_PROBE_SETTLE_SECONDS"])
     }
 
     private static var timeout: DispatchWorkItem?

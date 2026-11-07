@@ -25,8 +25,9 @@ Generate the corpus once with `nooveu-bench corpus Corpus/generated` (it is git-
 
 ## Layout and design rules
 
-`NooVeuCore` (no AppKit, no Metal) → `NooVeuRender` (Metal canvas) → `NooVeuApp` (AppKit shell);
-`NooVeuBench` uses Core and Render.
+`NooVeuCore` (no AppKit, no Metal) → `NooVeuRender` (Metal canvas); `NooVeuShell` (the viewer
+window's logic: key bindings, `ViewerModel`, status text; no AppKit) uses Core; `NooVeuApp` (AppKit
+shell) uses all three and stays thin; `NooVeuBench` uses Core and Render.
 
 - **Decoding never happens on the main thread, and a decoded image is fully decoded.**
   `ImageDecoder` always returns a bitmap that needs no further work. ImageIO decodes lazily, and a
@@ -47,8 +48,11 @@ Generate the corpus once with `nooveu-bench corpus Corpus/generated` (it is git-
   to the source's footprint, so a sharper texture can replace it without moving the view.
 - **First views are decoded at display size** (`DecodeStrategy` picks the fastest path per format);
   full resolution follows only when the user zooms past what the small texture can show.
-- Keep pure logic in plain types with tests (`FlipState`, `UpgradePolicy`, `ViewTransform`) rather
-  than inside view controllers.
+- Keep logic out of AppKit: `ViewerModel` holds the load / upgrade / flip / screen-change rules and
+  takes everything it depends on through an `Environment` of closures, so tests drive it with
+  fakes and decide when each decode and upload finishes. New viewer behaviour goes in the model
+  (or a plain type like `FlipState`, `UpgradePolicy`, `KeyBindings`), with a test; the controller
+  only translates events and supplies the real decoder, uploader and window.
 - No network access. No telemetry.
 
 ## Testing conventions
@@ -57,7 +61,12 @@ Generate the corpus once with `nooveu-bench corpus Corpus/generated` (it is git-
   catches it, restore the code.
 - GPU tests render offscreen through `ImageRenderer` (the production draw path) and check pixels.
   They skip themselves where there is no Metal device.
-- A test must fail rather than hang when the code under test goes wrong.
+- A test must fail rather than hang when the code under test goes wrong. Tests that hold
+  asynchronous work behind gates use `Harness.settle()` (a 5 s deadline that frees the gates and
+  records an issue) and a suite `.timeLimit`. Check with a mutant that deadlocks.
+- When mutation-testing, pass the exact test type name to `--filter` (`ViewerModelTests`, not the
+  suite's display name) and check the test count printed: a wrong filter runs zero tests and looks
+  like a pass.
 
 ## Measuring
 
@@ -66,6 +75,8 @@ Generate the corpus once with `nooveu-bench corpus Corpus/generated` (it is git-
   about to be released still counts. The decode cache (512 MB budget) is separate.
 - `presentedTime` is 0 for an occluded window; never wait for it to become non-zero.
 - Known, tracked misses: 24 MP PNG first view and PNG launch time.
+- CI runs the benchmark on a GitHub runner (an M1-class virtual machine) as an informational job:
+  the nearest thing to a low-end Mac we can measure. Its numbers are noisy and never fail the build.
 
 ## Toolchain notes
 
