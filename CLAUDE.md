@@ -39,8 +39,7 @@ shell) uses all three and stays thin; `NooVeuBench` uses Core and Render.
   decode whose viewer moved on cannot be interrupted and keeps its slot). Use
   `FolderNavigator.canonical` for any URL that becomes a cache key. The cache is emptied on system
   memory pressure.
-- **Large images are served in tiles** (`Sources/NooVeuCore/Tiling/`; the renderer and viewer use it
-  from slice 1.2b/1.2c). `TileGrid` is pure geometry (pyramid levels, tile areas with a 1 px border so
+- **Large images are served in tiles** (`Sources/NooVeuCore/Tiling/`; the viewer uses it from slice 1.2c). `TileGrid` is pure geometry (pyramid levels, tile areas with a 1 px border so
   smooth sampling shows no seams, which level suits a zoom). A `TileSource` produces tile bitmaps:
   `BufferTileSource` decodes the image once into a buffer we own (JPEG, PNG and everything ImageIO
   cannot decode a region of: JPEG's first tile otherwise decodes the whole image and ImageIO caches it
@@ -54,6 +53,15 @@ shell) uses all three and stays thin; `NooVeuBench` uses Core and Render.
   at reduced detail (`detailFactor`). `TileLoader` turns "these tiles are wanted now" into decodes:
   nearest first, a few at a time, dropping what the view has left, caching, never retrying a failure.
   Only images with a longest side above 8192 px are tiled (`LargeImagePolicy`).
+  In `NooVeuRender`, `TileLayer` ties it together for a view: it asks `TileLoader` for the tiles
+  `visibleSourceRect` needs, uploads each arriving bitmap to the GPU off the main thread
+  (`TileTextureCache`: BGRA textures of the padded tile, 256 MB budget, tiles in use are never evicted,
+  least recently used go first), and returns `TileQuad`s to draw after the base texture. A tile quad
+  shows the tile's content, not its border, so smooth sampling at its edge reads the neighbour's
+  pixels; every quad is placed from the source's own footprint (`sourceArea(of:)`) through
+  `ViewTransform`, so shared edges are the same number. Missing tiles are stood in for by resident
+  coarser ones (drawn coarsest first). The layer tells the loader what the GPU already holds
+  (`alreadyHeld`); asking every frame must not decode or upload anything twice.
 - **Upgrade to full resolution at most once per displayed image.** A full-resolution request can
   come back no larger than the texture on screen (very wide JPEGs are subsampled to stay within
   the GPU's 16384 px texture limit), so "is anything sharper available" cannot be assumed.

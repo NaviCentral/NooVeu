@@ -133,6 +133,14 @@ public struct ViewTransform: Equatable, Sendable {
         return CGSize(width: snapped(left) - left, height: snapped(bottom) - bottom)
     }
 
+    /// The part of the image the view shows, in image pixels, clipped to the image.
+    public var visibleSourceRect: CGRect {
+        guard zoom > 0, viewSize.width > 0, viewSize.height > 0 else { return .zero }
+        let width = viewSize.width * backingScale / zoom, height = viewSize.height * backingScale / zoom
+        let visible = CGRect(x: center.x - width / 2, y: center.y - height / 2, width: width, height: height)
+        return visible.intersection(CGRect(origin: .zero, size: imageSize))
+    }
+
     /// The image's rectangle in Metal clip space as (minX, minY, maxX, maxY), each -1…1.
     public var clipRect: SIMD4<Float> {
         guard viewSize.width > 0, viewSize.height > 0 else { return .zero }
